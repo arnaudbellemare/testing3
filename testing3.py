@@ -11,7 +11,36 @@ from typing import Optional
 import streamlit as st
 
 ###############################################################################
-# 1) FETCH DATA FUNCTIONS
+# SESSION STATE & SIDEBAR INPUTS
+###############################################################################
+if "username" not in st.session_state:
+    st.session_state["username"] = "Guest"
+
+st.title("CNO Dashboard")
+st.write(f"Welcome, {st.session_state['username']}!")
+
+lookback_options = {
+    "1 Day": 1440,
+    "3 Days": 4320,
+    "1 Week": 10080,
+    "2 Weeks": 20160,
+    "1 Month": 43200
+}
+global_lookback_label = st.sidebar.selectbox(
+    "Select Global Lookback Period",
+    list(lookback_options.keys()),
+    key="global_lookback_label"
+)
+global_lookback_minutes = lookback_options[global_lookback_label]
+timeframe = st.sidebar.selectbox("Select Timeframe", ["1m", "5m", "15m", "1h"], key="timeframe_widget")
+analysis_type = st.sidebar.selectbox(
+    "Select Analysis Type",
+    ["Hawkes BVC", "ADC", "ACI", "BSACD1"],
+    key="analysis_type"
+)
+
+###############################################################################
+# 1) FETCH DATA FUNCTION
 ###############################################################################
 def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
     exchange = ccxt.kraken()
@@ -19,7 +48,7 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
     cutoff_ts = now_ms - lookback_minutes * 60 * 1000
     all_ohlcv = []
     since = cutoff_ts
-    max_limit = 1440  # max candles per request
+    max_limit = 1440
     while True:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=max_limit)
         if not ohlcv:
@@ -98,7 +127,7 @@ def accumulated_candle_index(klines: NDArray, lookback: int = 20) -> NDArray:
     return aci
 
 ###############################################################################
-# 3) BS DISTRIBUTION FUNCTIONS (for BSACD1 model)
+# 3) BS DISTRIBUTION FUNCTIONS (for BSACD1)
 ###############################################################################
 def bs_pdf(x, kappa, sigma):
     if x <= 0:
@@ -155,7 +184,7 @@ class HawkesBVC:
     def eval(self, df: pd.DataFrame, scale=1e4):
         df = df.copy().sort_values("stamp")
         prices = df["close"]
-        cumr = np.log(prices / prices.iloc[0])
+        cumr = np.log(prices/ prices.iloc[0])
         r = cumr.diff().fillna(0.0)
         volume = df["volume"]
         sigma = r.rolling(self.window).std().fillna(0.0)
@@ -185,7 +214,7 @@ class ACDBVC:
         mean_dur = df["duration"].mean()
         std_dur = df["duration"].std() or 1e-10
         df["std_resid"] = (df["duration"] - mean_dur) / std_dur
-        df["price_change"] = np.log(df["close"] / df["close"].shift(1)).fillna(0)
+        df["price_change"] = np.log(df["close"]/df["close"].shift(1)).fillna(0)
         df["label"] = -df["std_resid"] * df["price_change"]
         df["weighted_volume"] = df["volume"] * df["label"]
         alpha_exp = np.exp(-self.kappa)
@@ -218,7 +247,7 @@ class ACIBVC:
         intensities = self.estimate_intensity(times, self.kappa)
         df = df.iloc[:len(intensities)]
         df["intensity"] = intensities
-        df["price_change"] = np.log(df["close"] / df["close"].shift(1)).fillna(0)
+        df["price_change"] = np.log(df["close"]/df["close"].shift(1)).fillna(0)
         df["label"] = df["intensity"] * df["price_change"]
         df["weighted_volume"] = df["volume"] * df["label"]
         alpha_exp = np.exp(-self.kappa)
@@ -313,7 +342,7 @@ best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01,0.05,0.1,0.
 st.write("Best ACI kappa:", best_kappa_aci, "with correlation:", best_score_aci)
 
 # ---------------------------------------------------------------------------
-# Indicator Evaluation: use selected indicator based on analysis_type
+# Indicator Evaluation: Choose based on analysis_type
 # ---------------------------------------------------------------------------
 if analysis_type == "Hawkes BVC":
     st.write("### Hawkes BVC Analysis")
@@ -324,11 +353,8 @@ elif analysis_type == "ADC":
     threshold_param = st.slider("Directional Change Threshold (%)", min_value=0.1, max_value=5.0,
                                   value=0.5, step=0.1) / 100
     indicator_title = "ADC"
-    # Use the same directional_change function defined earlier
-    # Here we simply compute the ADC indicator without smoothing for demonstration.
     df_temp = df.copy().sort_values("stamp")
     adc_vals = directional_change(df_temp["close"].values, threshold=threshold_param)
-    # Scale ADC indicator
     if np.max(np.abs(adc_vals)) != 0:
         adc_vals = adc_vals / np.max(np.abs(adc_vals)) * 1e4
     indicator_df = pd.DataFrame({"stamp": df_temp["stamp"], "bvc": adc_vals})
@@ -350,16 +376,13 @@ elif analysis_type == "BSACD1":
     res = minimize(bsacd1_negloglik, init_params, args=(durations,), method="L-BFGS-B")
     st.write("Estimated BSACD1 parameters:", res.x)
     fitted_mu = compute_fitted_mu(res.x, durations)
-    # Use the fitted μ starting from the second observation
     indicator_df = pd.DataFrame({
         "stamp": df_reset["stamp"].iloc[1:].reset_index(drop=True),
         "bvc": fitted_mu[1:]
     })
     indicator_title = "Fitted μ"
 
-# ---------------------------------------------------------------------------
-# Merge indicator with price data for plotting
-# ---------------------------------------------------------------------------
+# Merge indicator with price data (for non-BSACD1, merge on stamp)
 if analysis_type != "BSACD1":
     df_merged = df.merge(indicator_df, on="stamp", how="inner")
     df_merged = df_merged.sort_values("stamp")
@@ -370,7 +393,6 @@ else:
 ###############################################################################
 # 8) PLOTTING THE CHART
 ###############################################################################
-# For non-BSACD1 analyses, plot a gradient-colored price chart.
 if analysis_type != "BSACD1":
     norm_bvc = plt.Normalize(-1, 1)
     fig, ax = plt.subplots(figsize=(10, 4), dpi=120)
@@ -394,7 +416,6 @@ if analysis_type != "BSACD1":
     plt.tight_layout()
     st.pyplot(fig)
 else:
-    # For BSACD1, plot the fitted μ (conditional mean durations)
     fig, ax = plt.subplots(figsize=(10, 3), dpi=120)
     ax.plot(df_merged["stamp"], df_merged["bvc"], color="green", linewidth=1.2, label="Fitted μ")
     ax.set_xlabel("Time", fontsize=8)
@@ -407,7 +428,6 @@ else:
     plt.setp(ax.get_yticklabels(), fontsize=7)
     st.pyplot(fig)
 
-# Optionally, plot the raw indicator (for non-BSACD1)
 if analysis_type != "BSACD1":
     fig_ind, ax_ind = plt.subplots(figsize=(10, 3), dpi=120)
     ax_ind.plot(indicator_df["stamp"], indicator_df["bvc"], color="blue", linewidth=1, label=indicator_title)
