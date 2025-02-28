@@ -19,6 +19,7 @@ if "username" not in st.session_state:
 st.title("CNO Dashboard")
 st.write(f"Welcome, {st.session_state['username']}!")
 
+# Sidebar inputs
 lookback_options = {
     "1 Day": 1440,
     "3 Days": 4320,
@@ -43,7 +44,7 @@ analysis_type = st.sidebar.selectbox(
     key="analysis_type"
 )
 
-# For tuning the decay parameter (kappa) for the ACD indicator:
+# For tuning the decay parameter in other indicators if needed.
 kappa_acd = st.sidebar.slider("ACD decay parameter (kappa)", min_value=0.001, max_value=1.0, value=0.1, step=0.001)
 
 ###############################################################################
@@ -65,7 +66,7 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
         if last_timestamp <= cutoff_ts or len(ohlcv) < max_limit:
             break
         since = last_timestamp + 1
-    df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["stamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
 
@@ -127,7 +128,68 @@ def bs_logpdf(x, kappa, sigma):
     term = (np.sqrt(x/sigma) - np.sqrt(sigma/x))**2
     return -np.log(2*kappa*x*np.sqrt(2*np.pi)) + np.log(np.sqrt(x/sigma)+np.sqrt(sigma/x)) - term/(2*kappa**2)
 
+###############################################################################
+# 4) BSACD1 MODEL (Mean-based) FUNCTIONS
+###############################################################################
+def bsacd1_negloglik(params, X):
+    beta0, alpha, beta, tau = params
+    n = len(X)
+    mu = np.empty(n)
+    mu[0] = np.median(X)
+    neglog = 0.0
+    for i in range(1, n):
+        mu[i] = np.exp(beta0 + alpha * np.log(mu[i-1]) + beta * (X[i-1]/mu[i-1]))
+        ratio = X[i] / mu[i]
+        ll = bs_logpdf(ratio, tau, 1) - np.log(mu[i])
+        neglog -= ll
+    return neglog
 
+def compute_fitted_mu(params, X):
+    beta0, alpha, beta, tau = params
+    n = len(X)
+    mu = np.empty(n)
+    mu[0] = np.median(X)
+    for i in range(1, n):
+        mu[i] = np.exp(beta0 + alpha * np.log(mu[i-1]) + beta * (X[i-1]/mu[i-1]))
+    return mu
+
+###############################################################################
+# 5) ACD INDICATOR (Autoregressive Conditional Duration)
+###############################################################################
+# This version mimics the recursive accumulation of the Hawkes model.
+# Let Δt_i be the duration between events. Then:
+#   ACD_i = ACD_{i-1} * exp(-kappa * Δt_i) + Δt_i
+# We use the ideal parameters as fixed values.
+class ACDIndicator:
+    def __init__(self, kappa_decay=0.1):
+        self.kappa_decay = kappa_decay
+        # Ideal ACD parameters (from literature or theoretical calibration)
+        # For demonstration, we use:
+        self.omega = 0.5
+        self.alpha = 0.3
+        self.beta  = 0.2
+
+    def eval(self, df: pd.DataFrame, scale=1e4):
+        df = df.copy().sort_values("stamp")
+        # Compute durations (in seconds)
+        df["duration"] = df["stamp"].diff().dt.total_seconds()
+        durations = df["duration"].dropna().values  # length = N - 1
+        if len(durations) == 0:
+            return pd.DataFrame({"stamp": [], "bvc": []})
+        # Recursive accumulation using an exponential decay
+        acd = np.empty(len(durations))
+        acd[0] = durations[0]  # initial value
+        for i in range(1, len(durations)):
+            # Use the decay parameter in an exponential manner
+            acd[i] = acd[i-1] * np.exp(-self.kappa_decay * durations[i]) + durations[i]
+        # Optionally, scale the indicator
+        if np.max(np.abs(acd)) != 0:
+            acd = acd / np.max(np.abs(acd)) * scale
+        indicator_df = pd.DataFrame({
+            "stamp": df["stamp"].iloc[1:].reset_index(drop=True),
+            "bvc": acd
+        })
+        return indicator_df
 
 ###############################################################################
 # 6) INDICATOR CLASSES (HawkesBVC, ACDBVC, ACIBVC)
@@ -162,6 +224,35 @@ class HawkesBVC:
             bvc = bvc / np.max(np.abs(bvc)) * scale
         return pd.DataFrame({"stamp": df["stamp"], "bvc": bvc})
 
+class ACDBVC:
+    def __init__(self, kappa=0.1):
+        self.kappa = kappa
+
+    def eval(self, df: pd.DataFrame, scale=1e5):
+        df = df.copy().sort_values("stamp")
+        df["time_s"] = df["stamp"].astype(np.int64) // 10**9
+        df["duration"] = df["time_s"].diff().shift(-1)
+        df = df.dropna(subset=["duration"])
+        df = df[df["duration"] > 0]
+        if len(df) < 10:
+            return pd.DataFrame({"stamp": [], "bvc": []})
+        mean_dur = df["duration"].mean()
+        std_dur = df["duration"].std() or 1e-10
+        df["std_resid"] = (df["duration"] - mean_dur) / std_dur
+        df["price_change"] = np.log(df["close"] / df["close"].shift(1)).fillna(0)
+        df["label"] = -df["std_resid"] * df["price_change"]
+        df["weighted_volume"] = df["volume"] * df["label"]
+        alpha_exp = np.exp(-self.kappa)
+        bvc_list = []
+        current_bvc = 0.0
+        for wv in df["weighted_volume"].values:
+            current_bvc = current_bvc * alpha_exp + wv
+            bvc_list.append(current_bvc)
+        bvc = np.array(bvc_list)
+        if np.max(np.abs(bvc)) != 0:
+            bvc = bvc / np.max(np.abs(bvc)) * scale
+        df["bvc"] = bvc
+        return df[["stamp", "bvc"]].copy()
 
 class ACIBVC:
     def __init__(self, kappa=0.1):
@@ -215,11 +306,6 @@ def tune_kappa_hawkes(df_prices, kappa_grid=None, scale=1e4):
             best_score = corr_val
             best_kappa = k
     return best_kappa, best_score
-
-def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e4):
-    # We do not really tune parameters for the linear ACD model in this simple version.
-    # This function is included for uniformity.
-    return 0, 0
 
 def tune_kappa_aci(df_prices, kappa_grid=None, scale=1e5):
     if kappa_grid is None:
@@ -291,10 +377,8 @@ else:
 best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0])
 st.write("Best Hawkes kappa:", best_kappa_hawkes, "with correlation:", best_score_hawkes)
 
-# For the Linear ACD model, we now use the ideal parameters provided by the user via sliders.
-omega = st.sidebar.slider("omega (ACD)", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
-alpha_par = st.sidebar.slider("alpha (ACD)", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
-beta_par = st.sidebar.slider("beta (ACD)", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
+# For the Linear ACD model, use the ideal parameters hardcoded in ACDIndicator.
+acd_indicator = ACDIndicator()  # uses omega=0.5, alpha=0.3, beta=0.2 by default
 
 # For ACIBVC tuning:
 best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0])
@@ -310,7 +394,7 @@ if analysis_type == "Hawkes BVC":
 elif analysis_type == "ACD":
     st.write("### ACD (Autoregressive Conditional Duration) Analysis")
     indicator_title = "ACD"
-    indicator_df = ACDIndicator(omega=omega, alpha=alpha_par, beta=beta_par).eval(df, scale=1e4)
+    indicator_df = acd_indicator.eval(df, scale=1e4)
 elif analysis_type == "ACI":
     st.write("### Accumulated Candle Index (ACI) Analysis")
     indicator_title = "ACI"
