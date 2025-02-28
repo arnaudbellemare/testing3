@@ -36,6 +36,7 @@ timeframe = st.sidebar.selectbox(
     "Select Timeframe", ["1m", "5m", "15m", "1h"],
     key="timeframe_widget"
 )
+# Options: "Hawkes BVC", "ADC", "ACI", "BSACD1"
 analysis_type = st.sidebar.selectbox(
     "Select Analysis Type",
     ["Hawkes BVC", "ADC", "ACI", "BSACD1"],
@@ -51,7 +52,7 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
     cutoff_ts = now_ms - lookback_minutes * 60 * 1000
     all_ohlcv = []
     since = cutoff_ts
-    max_limit = 1440  # max candles per request
+    max_limit = 1440
     while True:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=max_limit)
         if not ohlcv:
@@ -61,7 +62,7 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
         if last_timestamp <= cutoff_ts or len(ohlcv) < max_limit:
             break
         since = last_timestamp + 1
-    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
     df["stamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
 
@@ -77,28 +78,6 @@ def ema(arr_in: NDArray, window: int, alpha: Optional[float] = 0) -> NDArray:
     for i in range(1, n):
         ewma[i] = (arr_in[i] * alpha) + (ewma[i-1] * (1 - alpha))
     return ewma
-
-@njit(cache=True)
-def directional_change(prices: NDArray, threshold: float = 0.005) -> NDArray:
-    # (This function is now unused for ADC)
-    n = len(prices)
-    adc = np.zeros(n, dtype=np.float64)
-    if n < 2:
-        return adc
-    ref_price = prices[0]
-    direction = 0
-    cumulative_change = 0.0
-    for i in range(1, n):
-        pct_change = (prices[i] - ref_price) / ref_price
-        if abs(pct_change) >= threshold:
-            if direction == 0 or (direction == 1 and pct_change < -threshold) or (direction == -1 and pct_change > threshold):
-                direction = 1 if pct_change > 0 else -1
-                ref_price = prices[i]
-                cumulative_change = direction * threshold
-            else:
-                cumulative_change += pct_change - (direction * threshold)
-        adc[i] = cumulative_change
-    return adc
 
 @njit(cache=True)
 def accumulated_candle_index(klines: NDArray, lookback: int = 20) -> NDArray:
@@ -131,7 +110,25 @@ def accumulated_candle_index(klines: NDArray, lookback: int = 20) -> NDArray:
     return aci
 
 ###############################################################################
-# 3) BS DISTRIBUTION FUNCTIONS (for BSACD1)
+# 3) NEW ACD INDICATOR FUNCTION (similar to ACI accumulation)
+###############################################################################
+def acd_indicator(timestamps, kappa):
+    """
+    Computes an ACD indicator based solely on durations between timestamps,
+    accumulating them with an exponential decay.
+    """
+    # Convert timestamps to seconds since first timestamp
+    times = (timestamps - timestamps[0]).astype('timedelta64[s]').astype(np.float64)
+    durations = np.diff(times)  # length = N-1
+    adi = np.zeros_like(durations)
+    if len(durations) > 0:
+        adi[0] = durations[0]
+        for i in range(1, len(durations)):
+            adi[i] = adi[i-1] * np.exp(-kappa * durations[i]) + durations[i]
+    return adi
+
+###############################################################################
+# 4) BS DISTRIBUTION FUNCTIONS (for BSACD1)
 ###############################################################################
 def bs_pdf(x, kappa, sigma):
     if x <= 0:
@@ -146,7 +143,7 @@ def bs_logpdf(x, kappa, sigma):
     return -np.log(2*kappa*x*np.sqrt(2*np.pi)) + np.log(np.sqrt(x/sigma)+np.sqrt(sigma/x)) - term/(2*kappa**2)
 
 ###############################################################################
-# 4) BSACD1 MODEL (Mean-based) FUNCTIONS
+# 5) BSACD1 MODEL (Mean-based) FUNCTIONS
 ###############################################################################
 def bsacd1_negloglik(params, X):
     beta0, alpha, beta, tau = params
@@ -171,18 +168,7 @@ def compute_fitted_mu(params, X):
     return mu
 
 ###############################################################################
-# 5) SIMPLE ACD MODEL (Linear ACD(1,1))
-###############################################################################
-def simple_acd(durations, omega, alpha, beta):
-    n = len(durations)
-    mu = np.empty(n)
-    mu[0] = np.median(durations)
-    for i in range(1, n):
-        mu[i] = omega + alpha * durations[i-1] + beta * mu[i-1]
-    return mu
-
-###############################################################################
-# 6) INDICATOR CLASSES
+# 6) INDICATOR CLASSES (HawkesBVC, ACDBVC, ACIBVC)
 ###############################################################################
 class HawkesBVC:
     def __init__(self, window=20, kappa=0.1, dof=0.25):
@@ -297,7 +283,8 @@ def tune_kappa_hawkes(df_prices, kappa_grid=None, scale=1e4):
             best_kappa = k
     return best_kappa, best_score
 
-def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e5):
+def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e4):
+    # Tune using our new acd_indicator function
     if kappa_grid is None:
         kappa_grid = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5]
     df_prices = df_prices.copy().sort_values("stamp")
@@ -305,11 +292,13 @@ def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e5):
     best_kappa = None
     best_score = -999.0
     for k in kappa_grid:
-        model = ACDBVC(kappa=k)
-        bvc_metrics = model.eval(df_prices, scale=scale)
-        if len(bvc_metrics) == 0:
-            continue
-        merged = df_prices.merge(bvc_metrics, on="stamp", how="inner")
+        # Compute ACD indicator from timestamps using our new function
+        adi_vals = acd_indicator(df_prices["stamp"].values, kappa=k)
+        temp_df = pd.DataFrame({
+            "stamp": df_prices["stamp"].iloc[1:].reset_index(drop=True),
+            "bvc": adi_vals
+        })
+        merged = df_prices.merge(temp_df, on="stamp", how="inner")
         corr_val = merged[["log_return", "bvc"]].corr().iloc[0, 1]
         if corr_val > best_score:
             best_score = corr_val
@@ -362,7 +351,7 @@ best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01, 0
 st.write("Best Hawkes kappa:", best_kappa_hawkes, "with correlation:", best_score_hawkes)
 
 best_kappa_acd, best_score_acd = tune_kappa_acd(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
-st.write("Best ACD kappa:", best_kappa_acd, "with correlation:", best_score_acd)
+st.write("Best ACD (duration indicator) kappa:", best_kappa_acd, "with correlation:", best_score_acd)
 
 best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
 st.write("Best ACI kappa:", best_kappa_aci, "with correlation:", best_score_aci)
@@ -376,19 +365,16 @@ if analysis_type == "Hawkes BVC":
     indicator_df = HawkesBVC(window=20, kappa=best_kappa_hawkes).eval(df, scale=1e4)
 elif analysis_type == "ADC":
     st.write("### ACD (Autoregressive Conditional Duration) Analysis")
-    indicator_title = "Fitted μ (ACD)"
-    # For ACD, compute durations from timestamps
-    df_reset = df.sort_values("stamp").reset_index(drop=True)
-    df_reset["duration"] = df_reset["stamp"].diff().dt.total_seconds()
-    durations = df_reset["duration"].dropna().values  # length = N-1
-    # User inputs for simple ACD model parameters
-    omega = st.slider("omega", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
-    alpha_par = st.slider("alpha", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
-    beta_par = st.slider("beta", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
-    fitted_mu = simple_acd(durations, omega, alpha_par, beta_par)
+    indicator_title = "ACD"
+    # Compute ACD indicator using our acd_indicator function
+    df_temp = df.copy().sort_values("stamp")
+    acd_vals = acd_indicator(df_temp["stamp"].values, kappa=best_kappa_acd)
+    if np.max(np.abs(acd_vals)) != 0:
+        acd_vals = acd_vals / np.max(np.abs(acd_vals)) * 1e4
+    # Since acd_indicator returns N-1 values, use the stamps from index 1 onward
     indicator_df = pd.DataFrame({
-        "stamp": df_reset["stamp"].iloc[1:].reset_index(drop=True),
-        "bvc": fitted_mu
+        "stamp": df_temp["stamp"].iloc[1:].reset_index(drop=True),
+        "bvc": acd_vals
     })
 elif analysis_type == "ACI":
     st.write("### Accumulated Candle Index (ACI) Analysis")
@@ -408,7 +394,7 @@ elif analysis_type == "BSACD1":
     res = minimize(bsacd1_negloglik, init_params, args=(durations,), method="L-BFGS-B")
     st.write("Estimated BSACD1 parameters:", res.x)
     fitted_mu = compute_fitted_mu(res.x, durations)  # length should equal len(durations)
-    # Here we align the stamps with the fitted_mu vector
+    # Use stamps from index 1 to match fitted_mu length
     indicator_df = pd.DataFrame({
         "stamp": df_reset["stamp"].iloc[1:1+len(fitted_mu)].reset_index(drop=True),
         "bvc": fitted_mu
