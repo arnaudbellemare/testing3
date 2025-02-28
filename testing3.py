@@ -61,7 +61,7 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
         if last_timestamp <= cutoff_ts or len(ohlcv) < max_limit:
             break
         since = last_timestamp + 1
-    df = pd.DataFrame(all_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(all_ohlcv, columns=["timestamp","open","high","low","close","volume"])
     df["stamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
 
@@ -75,7 +75,7 @@ def ema(arr_in: NDArray, window: int, alpha: Optional[float] = 0) -> NDArray:
     ewma = np.empty(n, dtype=np.float64)
     ewma[0] = arr_in[0]
     for i in range(1, n):
-        ewma[i] = (arr_in[i] * alpha) + (ewma[i - 1] * (1 - alpha))
+        ewma[i] = (arr_in[i] * alpha) + (ewma[i-1] * (1 - alpha))
     return ewma
 
 @njit(cache=True)
@@ -208,7 +208,7 @@ class ACDBVC:
 
     def eval(self, df: pd.DataFrame, scale=1e5):
         df = df.copy().sort_values("stamp")
-        df["time_s"] = df["stamp"].astype(np.int64)//10**9
+        df["time_s"] = df["stamp"].astype(np.int64) // 10**9
         df["duration"] = df["time_s"].diff().shift(-1)
         df = df.dropna(subset=["duration"])
         df = df[df["duration"] > 0]
@@ -245,7 +245,7 @@ class ACIBVC:
 
     def eval(self, df: pd.DataFrame, scale=1e5):
         df = df.copy().sort_values("stamp")
-        df["time_s"] = df["stamp"].astype(np.int64)//10**9
+        df["time_s"] = df["stamp"].astype(np.int64) // 10**9
         times = df["time_s"].values
         intensities = self.estimate_intensity(times, self.kappa)
         df = df.iloc[:len(intensities)]
@@ -334,7 +334,7 @@ df = df.sort_values("stamp").reset_index(drop=True)
 st.write("Data range:", df["stamp"].min(), "to", df["stamp"].max())
 st.write("Number of rows:", len(df))
 
-# Compute additional fields for plotting:
+# Compute additional fields for plotting
 df["ScaledPrice"] = np.log(df["close"] / df["close"].iloc[0]) * 1e4
 df["ScaledPrice_EMA"] = ema(df["ScaledPrice"].values, window=10)
 df["cum_vol"] = df["volume"].cumsum()
@@ -345,7 +345,7 @@ if df["vwap"].iloc[0] == 0 or not np.isfinite(df["vwap"].iloc[0]):
 else:
     df["vwap_transformed"] = np.log(df["vwap"] / df["vwap"].iloc[0]) * 1e4
 
-# Tune parameters for each indicator
+# Tune parameters for each indicator and display results
 best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0])
 st.write("Best Hawkes kappa:", best_kappa_hawkes, "with correlation:", best_score_hawkes)
 
@@ -390,9 +390,10 @@ elif analysis_type == "BSACD1":
     res = minimize(bsacd1_negloglik, init_params, args=(durations,), method="L-BFGS-B")
     st.write("Estimated BSACD1 parameters:", res.x)
     fitted_mu = compute_fitted_mu(res.x, durations)
+    # Use fitted_mu as is (length equals durations length)
     indicator_df = pd.DataFrame({
         "stamp": df_reset["stamp"].iloc[1:].reset_index(drop=True),
-        "bvc": fitted_mu[1:]
+        "bvc": fitted_mu
     })
     indicator_title = "Fitted μ"
 
@@ -410,7 +411,6 @@ else:
 # 8) PLOTTING THE CHART
 ###############################################################################
 if analysis_type != "BSACD1":
-    # Plot gradient-colored price chart
     norm_bvc = plt.Normalize(-1, 1)
     fig, ax = plt.subplots(figsize=(10, 4), dpi=120)
     for i in range(len(df_merged)-1):
@@ -433,7 +433,6 @@ if analysis_type != "BSACD1":
     plt.tight_layout()
     st.pyplot(fig)
 else:
-    # For BSACD1, plot the fitted μ (conditional mean durations)
     fig, ax = plt.subplots(figsize=(10, 3), dpi=120)
     ax.plot(df_merged["stamp"], df_merged["bvc"], color="green", linewidth=1.2, label="Fitted μ")
     ax.set_xlabel("Time", fontsize=8)
@@ -446,7 +445,6 @@ else:
     plt.setp(ax.get_yticklabels(), fontsize=7)
     st.pyplot(fig)
 
-# Optionally, plot the raw indicator series for non-BSACD1 types.
 if analysis_type != "BSACD1":
     fig_ind, ax_ind = plt.subplots(figsize=(10, 3), dpi=120)
     ax_ind.plot(indicator_df["stamp"], indicator_df["bvc"], color="blue", linewidth=1, label=indicator_title)
