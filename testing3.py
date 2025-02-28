@@ -43,6 +43,9 @@ analysis_type = st.sidebar.selectbox(
     key="analysis_type"
 )
 
+# For tuning the decay parameter (kappa) for the ACD indicator:
+kappa_acd = st.sidebar.slider("ACD decay parameter (kappa)", min_value=0.001, max_value=1.0, value=0.1, step=0.001)
+
 ###############################################################################
 # 1) FETCH DATA FUNCTION
 ###############################################################################
@@ -62,7 +65,7 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
         if last_timestamp <= cutoff_ts or len(ohlcv) < max_limit:
             break
         since = last_timestamp + 1
-    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
     df["stamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
 
@@ -150,9 +153,9 @@ def compute_fitted_mu(params, X):
     return mu
 
 ###############################################################################
-# 5) LINEAR ACD INDICATOR (ACD(1,1) Model)
+# 5) ACD INDICATOR (Autoregressive Conditional Duration)
 ###############################################################################
-class LinearACDIndicator:
+class ACDIndicator:
     def __init__(self, omega=1.0, alpha=0.5, beta=0.3):
         self.omega = omega
         self.alpha = alpha
@@ -160,18 +163,21 @@ class LinearACDIndicator:
 
     def eval(self, df: pd.DataFrame, scale=1e4):
         df = df.copy().sort_values("stamp")
-        # Compute durations (in seconds) between successive timestamps
+        # Compute durations (in seconds) between successive timestamps.
+        # This yields an array of length N-1 if there are N timestamps.
         df["duration"] = df["stamp"].diff().dt.total_seconds()
-        durations = df["duration"].dropna().values  # length = N - 1
+        durations = df["duration"].dropna().values
         if len(durations) == 0:
             return pd.DataFrame({"stamp": [], "bvc": []})
+        # Recursively compute the conditional mean duration (psi)
         psi = np.empty(len(durations))
         psi[0] = np.median(durations)
         for i in range(1, len(durations)):
             psi[i] = self.omega + self.alpha * durations[i-1] + self.beta * psi[i-1]
+        # Optionally scale the indicator
         if np.max(np.abs(psi)) != 0:
             psi = psi / np.max(np.abs(psi)) * scale
-        # Return as 'bvc' to match downstream code
+        # Return with column name "bvc" to be consistent with other indicators
         indicator_df = pd.DataFrame({
             "stamp": df["stamp"].iloc[1:].reset_index(drop=True),
             "bvc": psi
@@ -295,21 +301,9 @@ def tune_kappa_hawkes(df_prices, kappa_grid=None, scale=1e4):
     return best_kappa, best_score
 
 def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e4):
-    # For our Linear ACD Indicator, tuning might be less relevant but we include it for uniformity.
-    if kappa_grid is None:
-        kappa_grid = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5]
-    df_prices = df_prices.copy().sort_values("stamp")
-    df_prices["log_return"] = np.log(df_prices["close"]).diff()
-    best_kappa = None
-    best_score = -999.0
-    for k in kappa_grid:
-        indicator_df = LinearACDIndicator().eval(df_prices, scale=scale)
-        merged = df_prices.merge(indicator_df, left_on="stamp", right_on="stamp", how="inner")
-        corr_val = merged[["log_return", "bvc"]].corr().iloc[0, 1]
-        if corr_val > best_score:
-            best_score = corr_val
-            best_kappa = k
-    return best_kappa, best_score
+    # We do not really tune parameters for the linear ACD model in this simple version.
+    # This function is included for uniformity.
+    return 0, 0
 
 def tune_kappa_aci(df_prices, kappa_grid=None, scale=1e5):
     if kappa_grid is None:
@@ -381,10 +375,13 @@ else:
 best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0])
 st.write("Best Hawkes kappa:", best_kappa_hawkes, "with correlation:", best_score_hawkes)
 
-best_kappa_acd, best_score_acd = tune_kappa_acd(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
-st.write("Best ACD (duration indicator) kappa:", best_kappa_acd, "with correlation:", best_score_acd)
+# For the Linear ACD model, we now use the ideal parameters provided by the user via sliders.
+omega = st.sidebar.slider("omega (ACD)", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
+alpha_par = st.sidebar.slider("alpha (ACD)", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
+beta_par = st.sidebar.slider("beta (ACD)", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
 
-best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
+# For ACIBVC tuning:
+best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0])
 st.write("Best ACI kappa:", best_kappa_aci, "with correlation:", best_score_aci)
 
 # ---------------------------------------------------------------------------
@@ -397,11 +394,7 @@ if analysis_type == "Hawkes BVC":
 elif analysis_type == "ACD":
     st.write("### ACD (Autoregressive Conditional Duration) Analysis")
     indicator_title = "ACD"
-    # Use the Linear ACD Indicator with user-controlled parameters
-    omega = st.slider("omega", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
-    alpha_par = st.slider("alpha", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
-    beta_par = st.slider("beta", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
-    indicator_df = LinearACDIndicator(omega=omega, alpha=alpha_par, beta=beta_par).eval(df, scale=1e4)
+    indicator_df = ACDIndicator(omega=omega, alpha=alpha_par, beta=beta_par).eval(df, scale=1e4)
 elif analysis_type == "ACI":
     st.write("### Accumulated Candle Index (ACI) Analysis")
     indicator_title = "ACI"
@@ -476,7 +469,6 @@ else:
 
 if analysis_type != "BSACD1":
     fig_ind, ax_ind = plt.subplots(figsize=(10, 3), dpi=120)
-    # For ACD, our LinearACDIndicator returns column "bvc"
     ax_ind.plot(indicator_df["stamp"], indicator_df["bvc"], color="blue", linewidth=1, label=indicator_title)
     ax_ind.set_xlabel("Time", fontsize=8)
     ax_ind.set_ylabel(indicator_title, fontsize=8)
