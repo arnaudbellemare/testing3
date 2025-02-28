@@ -19,7 +19,6 @@ if "username" not in st.session_state:
 st.title("CNO Dashboard")
 st.write(f"Welcome, {st.session_state['username']}!")
 
-# Sidebar inputs
 lookback_options = {
     "1 Day": 1440,
     "3 Days": 4320,
@@ -37,7 +36,7 @@ timeframe = st.sidebar.selectbox(
     "Select Timeframe", ["1m", "5m", "15m", "1h"],
     key="timeframe_widget"
 )
-# Change option from ADC to ACD to represent Autoregressive Conditional Duration
+# Options: "Hawkes BVC", "ACD", "ACI", "BSACD1"
 analysis_type = st.sidebar.selectbox(
     "Select Analysis Type",
     ["Hawkes BVC", "ACD", "ACI", "BSACD1"],
@@ -165,17 +164,17 @@ class LinearACDIndicator:
         df["duration"] = df["stamp"].diff().dt.total_seconds()
         durations = df["duration"].dropna().values  # length = N - 1
         if len(durations) == 0:
-            return pd.DataFrame({"stamp": [], "acd": []})
+            return pd.DataFrame({"stamp": [], "bvc": []})
         psi = np.empty(len(durations))
         psi[0] = np.median(durations)
         for i in range(1, len(durations)):
             psi[i] = self.omega + self.alpha * durations[i-1] + self.beta * psi[i-1]
-        # Scale the indicator if needed
         if np.max(np.abs(psi)) != 0:
             psi = psi / np.max(np.abs(psi)) * scale
+        # Return as 'bvc' to match downstream code
         indicator_df = pd.DataFrame({
             "stamp": df["stamp"].iloc[1:].reset_index(drop=True),
-            "acd": psi
+            "bvc": psi
         })
         return indicator_df
 
@@ -296,6 +295,7 @@ def tune_kappa_hawkes(df_prices, kappa_grid=None, scale=1e4):
     return best_kappa, best_score
 
 def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e4):
+    # For our Linear ACD Indicator, tuning might be less relevant but we include it for uniformity.
     if kappa_grid is None:
         kappa_grid = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5]
     df_prices = df_prices.copy().sort_values("stamp")
@@ -303,10 +303,9 @@ def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e4):
     best_kappa = None
     best_score = -999.0
     for k in kappa_grid:
-        # Use our Linear ACD Indicator
         indicator_df = LinearACDIndicator().eval(df_prices, scale=scale)
         merged = df_prices.merge(indicator_df, left_on="stamp", right_on="stamp", how="inner")
-        corr_val = merged[["log_return", "acd"]].corr().iloc[0, 1]
+        corr_val = merged[["log_return", "bvc"]].corr().iloc[0, 1]
         if corr_val > best_score:
             best_score = corr_val
             best_kappa = k
@@ -332,35 +331,7 @@ def tune_kappa_aci(df_prices, kappa_grid=None, scale=1e5):
     return best_kappa, best_score
 
 ###############################################################################
-# 8) LINEAR ACD INDICATOR (ACD(1,1) Model)
-###############################################################################
-class LinearACDIndicator:
-    def __init__(self, omega=1.0, alpha=0.5, beta=0.3):
-        self.omega = omega
-        self.alpha = alpha
-        self.beta = beta
-
-    def eval(self, df: pd.DataFrame, scale=1e4):
-        df = df.copy().sort_values("stamp")
-        # Compute durations (in seconds) between successive timestamps
-        df["duration"] = df["stamp"].diff().dt.total_seconds()
-        durations = df["duration"].dropna().values  # length = N - 1
-        if len(durations) == 0:
-            return pd.DataFrame({"stamp": [], "acd": []})
-        psi = np.empty(len(durations))
-        psi[0] = np.median(durations)
-        for i in range(1, len(durations)):
-            psi[i] = self.omega + self.alpha * durations[i-1] + self.beta * psi[i-1]
-        if np.max(np.abs(psi)) != 0:
-            psi = psi / np.max(np.abs(psi)) * scale
-        indicator_df = pd.DataFrame({
-            "stamp": df["stamp"].iloc[1:].reset_index(drop=True),
-            "acd": psi
-        })
-        return indicator_df
-
-###############################################################################
-# 9) BSACD1 MODEL (Mean-based) FUNCTIONS
+# 8) BSACD1 MODEL (Mean-based) FUNCTIONS
 ###############################################################################
 def bsacd1_negloglik(params, X):
     beta0, alpha, beta, tau = params
@@ -385,7 +356,7 @@ def compute_fitted_mu(params, X):
     return mu
 
 ###############################################################################
-# 10) MAIN SCRIPT (STREAMLIT APP)
+# 9) MAIN SCRIPT (STREAMLIT APP)
 ###############################################################################
 st.header("Price & Indicator Analysis")
 
@@ -426,7 +397,7 @@ if analysis_type == "Hawkes BVC":
 elif analysis_type == "ACD":
     st.write("### ACD (Autoregressive Conditional Duration) Analysis")
     indicator_title = "ACD"
-    # Use the Linear ACD model (ACD(1,1))
+    # Use the Linear ACD Indicator with user-controlled parameters
     omega = st.slider("omega", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
     alpha_par = st.slider("alpha", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
     beta_par = st.slider("beta", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
@@ -505,17 +476,12 @@ else:
 
 if analysis_type != "BSACD1":
     fig_ind, ax_ind = plt.subplots(figsize=(10, 3), dpi=120)
-    # For ACD, use the "acd" column instead of "bvc"
-    if analysis_type == "ACD":
-        ax_ind.plot(indicator_df["stamp"], indicator_df["acd"], color="blue", linewidth=1, label=indicator_title)
-        ax_ind.set_ylabel(indicator_title, fontsize=8)
-        ax_ind.set_title(f"{indicator_title} Over Time", fontsize=10)
-    else:
-        ax_ind.plot(indicator_df["stamp"], indicator_df["bvc"], color="blue", linewidth=1, label=indicator_title)
-        ax_ind.set_ylabel(indicator_title, fontsize=8)
-        ax_ind.set_title(f"{indicator_title} Over Time", fontsize=10)
+    # For ACD, our LinearACDIndicator returns column "bvc"
+    ax_ind.plot(indicator_df["stamp"], indicator_df["bvc"], color="blue", linewidth=1, label=indicator_title)
     ax_ind.set_xlabel("Time", fontsize=8)
+    ax_ind.set_ylabel(indicator_title, fontsize=8)
     ax_ind.legend(fontsize=7)
+    ax_ind.set_title(f"{indicator_title} Over Time", fontsize=10)
     ax_ind.xaxis.set_major_locator(mdates.AutoDateLocator())
     ax_ind.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
     plt.setp(ax_ind.get_xticklabels(), rotation=30, ha="right", fontsize=7)
