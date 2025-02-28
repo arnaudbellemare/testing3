@@ -19,6 +19,7 @@ if "username" not in st.session_state:
 st.title("CNO Dashboard")
 st.write(f"Welcome, {st.session_state['username']}!")
 
+# Sidebar inputs
 lookback_options = {
     "1 Day": 1440,
     "3 Days": 4320,
@@ -36,10 +37,10 @@ timeframe = st.sidebar.selectbox(
     "Select Timeframe", ["1m", "5m", "15m", "1h"],
     key="timeframe_widget"
 )
-# Options: "Hawkes BVC", "ADC" (here meaning our ACD model), "ACI", "BSACD1"
+# Change option from ADC to ACD to represent Autoregressive Conditional Duration
 analysis_type = st.sidebar.selectbox(
     "Select Analysis Type",
-    ["Hawkes BVC", "ADC", "ACI", "BSACD1"],
+    ["Hawkes BVC", "ACD", "ACI", "BSACD1"],
     key="analysis_type"
 )
 
@@ -150,9 +151,9 @@ def compute_fitted_mu(params, X):
     return mu
 
 ###############################################################################
-# 5) NEW ACD INDICATOR (Linear ACD(1,1) Model)
+# 5) LINEAR ACD INDICATOR (ACD(1,1) Model)
 ###############################################################################
-class ACDAIndicator:
+class LinearACDIndicator:
     def __init__(self, omega=1.0, alpha=0.5, beta=0.3):
         self.omega = omega
         self.alpha = alpha
@@ -165,16 +166,16 @@ class ACDAIndicator:
         durations = df["duration"].dropna().values  # length = N - 1
         if len(durations) == 0:
             return pd.DataFrame({"stamp": [], "acd": []})
-        mu = np.empty(len(durations))
-        mu[0] = np.median(durations)
+        psi = np.empty(len(durations))
+        psi[0] = np.median(durations)
         for i in range(1, len(durations)):
-            mu[i] = self.omega + self.alpha * durations[i-1] + self.beta * mu[i-1]
+            psi[i] = self.omega + self.alpha * durations[i-1] + self.beta * psi[i-1]
         # Scale the indicator if needed
-        if np.max(np.abs(mu)) != 0:
-            mu = mu / np.max(np.abs(mu)) * scale
+        if np.max(np.abs(psi)) != 0:
+            psi = psi / np.max(np.abs(psi)) * scale
         indicator_df = pd.DataFrame({
             "stamp": df["stamp"].iloc[1:].reset_index(drop=True),
-            "acd": mu
+            "acd": psi
         })
         return indicator_df
 
@@ -295,7 +296,6 @@ def tune_kappa_hawkes(df_prices, kappa_grid=None, scale=1e4):
     return best_kappa, best_score
 
 def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e4):
-    # For our simple ACD indicator, we use the acd_indicator function defined below
     if kappa_grid is None:
         kappa_grid = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5]
     df_prices = df_prices.copy().sort_values("stamp")
@@ -303,13 +303,10 @@ def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e4):
     best_kappa = None
     best_score = -999.0
     for k in kappa_grid:
-        acd_vals = acd_indicator(df_prices["stamp"].values, kappa=k)
-        temp_df = pd.DataFrame({
-            "stamp": df_prices["stamp"].iloc[1:].reset_index(drop=True),
-            "bvc": acd_vals
-        })
-        merged = df_prices.merge(temp_df, on="stamp", how="inner")
-        corr_val = merged[["log_return", "bvc"]].corr().iloc[0, 1]
+        # Use our Linear ACD Indicator
+        indicator_df = LinearACDIndicator().eval(df_prices, scale=scale)
+        merged = df_prices.merge(indicator_df, left_on="stamp", right_on="stamp", how="inner")
+        corr_val = merged[["log_return", "acd"]].corr().iloc[0, 1]
         if corr_val > best_score:
             best_score = corr_val
             best_kappa = k
@@ -335,9 +332,9 @@ def tune_kappa_aci(df_prices, kappa_grid=None, scale=1e5):
     return best_kappa, best_score
 
 ###############################################################################
-# 8) NEW ACD INDICATOR (Simple linear ACD(1,1) Model)
+# 8) LINEAR ACD INDICATOR (ACD(1,1) Model)
 ###############################################################################
-class ACDAIndicator:
+class LinearACDIndicator:
     def __init__(self, omega=1.0, alpha=0.5, beta=0.3):
         self.omega = omega
         self.alpha = alpha
@@ -347,24 +344,48 @@ class ACDAIndicator:
         df = df.copy().sort_values("stamp")
         # Compute durations (in seconds) between successive timestamps
         df["duration"] = df["stamp"].diff().dt.total_seconds()
-        durations = df["duration"].dropna().values  # length = N-1
+        durations = df["duration"].dropna().values  # length = N - 1
         if len(durations) == 0:
             return pd.DataFrame({"stamp": [], "acd": []})
-        mu = np.empty(len(durations))
-        mu[0] = np.median(durations)
+        psi = np.empty(len(durations))
+        psi[0] = np.median(durations)
         for i in range(1, len(durations)):
-            mu[i] = self.omega + self.alpha * durations[i-1] + self.beta * mu[i-1]
-        # Scale the indicator
-        if np.max(np.abs(mu)) != 0:
-            mu = mu / np.max(np.abs(mu)) * scale
+            psi[i] = self.omega + self.alpha * durations[i-1] + self.beta * psi[i-1]
+        if np.max(np.abs(psi)) != 0:
+            psi = psi / np.max(np.abs(psi)) * scale
         indicator_df = pd.DataFrame({
             "stamp": df["stamp"].iloc[1:].reset_index(drop=True),
-            "acd": mu
+            "acd": psi
         })
         return indicator_df
 
 ###############################################################################
-# 9) MAIN SCRIPT (STREAMLIT APP)
+# 9) BSACD1 MODEL (Mean-based) FUNCTIONS
+###############################################################################
+def bsacd1_negloglik(params, X):
+    beta0, alpha, beta, tau = params
+    n = len(X)
+    mu = np.empty(n)
+    mu[0] = np.median(X)
+    neglog = 0.0
+    for i in range(1, n):
+        mu[i] = np.exp(beta0 + alpha * np.log(mu[i-1]) + beta * (X[i-1]/mu[i-1]))
+        ratio = X[i] / mu[i]
+        ll = bs_logpdf(ratio, tau, 1) - np.log(mu[i])
+        neglog -= ll
+    return neglog
+
+def compute_fitted_mu(params, X):
+    beta0, alpha, beta, tau = params
+    n = len(X)
+    mu = np.empty(n)
+    mu[0] = np.median(X)
+    for i in range(1, n):
+        mu[i] = np.exp(beta0 + alpha * np.log(mu[i-1]) + beta * (X[i-1]/mu[i-1]))
+    return mu
+
+###############################################################################
+# 10) MAIN SCRIPT (STREAMLIT APP)
 ###############################################################################
 st.header("Price & Indicator Analysis")
 
@@ -402,15 +423,14 @@ if analysis_type == "Hawkes BVC":
     st.write("### Hawkes BVC Analysis")
     indicator_title = "BVC"
     indicator_df = HawkesBVC(window=20, kappa=best_kappa_hawkes).eval(df, scale=1e4)
-elif analysis_type == "ADC":
-    # Here ADC means our ACD model in the ACD(1,1) linear form implemented in ACDAIndicator.
+elif analysis_type == "ACD":
     st.write("### ACD (Autoregressive Conditional Duration) Analysis")
     indicator_title = "ACD"
-    # Let the user adjust omega, alpha, and beta
+    # Use the Linear ACD model (ACD(1,1))
     omega = st.slider("omega", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
     alpha_par = st.slider("alpha", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
     beta_par = st.slider("beta", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
-    indicator_df = ACDAIndicator(omega=omega, alpha=alpha_par, beta=beta_par).eval(df, scale=1e4)
+    indicator_df = LinearACDIndicator(omega=omega, alpha=alpha_par, beta=beta_par).eval(df, scale=1e4)
 elif analysis_type == "ACI":
     st.write("### Accumulated Candle Index (ACI) Analysis")
     indicator_title = "ACI"
@@ -428,8 +448,7 @@ elif analysis_type == "BSACD1":
     init_params = [0.0, 0.5, 0.0, 1.0]
     res = minimize(bsacd1_negloglik, init_params, args=(durations,), method="L-BFGS-B")
     st.write("Estimated BSACD1 parameters:", res.x)
-    fitted_mu = compute_fitted_mu(res.x, durations)  # length = len(durations)
-    # Use stamps from index 1 to match fitted_mu length exactly
+    fitted_mu = compute_fitted_mu(res.x, durations)  # length equals len(durations)
     indicator_df = pd.DataFrame({
         "stamp": df_reset["stamp"].iloc[1:1+len(fitted_mu)].reset_index(drop=True),
         "bvc": fitted_mu
@@ -486,11 +505,17 @@ else:
 
 if analysis_type != "BSACD1":
     fig_ind, ax_ind = plt.subplots(figsize=(10, 3), dpi=120)
-    ax_ind.plot(indicator_df["stamp"], indicator_df["bvc"], color="blue", linewidth=1, label=indicator_title)
+    # For ACD, use the "acd" column instead of "bvc"
+    if analysis_type == "ACD":
+        ax_ind.plot(indicator_df["stamp"], indicator_df["acd"], color="blue", linewidth=1, label=indicator_title)
+        ax_ind.set_ylabel(indicator_title, fontsize=8)
+        ax_ind.set_title(f"{indicator_title} Over Time", fontsize=10)
+    else:
+        ax_ind.plot(indicator_df["stamp"], indicator_df["bvc"], color="blue", linewidth=1, label=indicator_title)
+        ax_ind.set_ylabel(indicator_title, fontsize=8)
+        ax_ind.set_title(f"{indicator_title} Over Time", fontsize=10)
     ax_ind.set_xlabel("Time", fontsize=8)
-    ax_ind.set_ylabel(indicator_title, fontsize=8)
     ax_ind.legend(fontsize=7)
-    ax_ind.set_title(f"{indicator_title} Over Time", fontsize=10)
     ax_ind.xaxis.set_major_locator(mdates.AutoDateLocator())
     ax_ind.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
     plt.setp(ax_ind.get_xticklabels(), rotation=30, ha="right", fontsize=7)
