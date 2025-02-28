@@ -14,9 +14,6 @@ import streamlit as st
 # 1) FETCH DATA FUNCTIONS
 ###############################################################################
 def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
-    """
-    Fetch OHLCV data from Kraken over 'lookback_minutes' for 'symbol' at 'timeframe'.
-    """
     exchange = ccxt.kraken()
     now_ms = exchange.milliseconds()
     cutoff_ts = now_ms - lookback_minutes * 60 * 1000
@@ -116,15 +113,9 @@ def bs_logpdf(x, kappa, sigma):
     return -np.log(2*kappa*x*np.sqrt(2*np.pi)) + np.log(np.sqrt(x/sigma)+np.sqrt(sigma/x)) - term/(2*kappa**2)
 
 ###############################################################################
-# 4) BSACD1 MODEL (Mean-based) FUNCTIONS
+# 4) BSACD1 MODEL (Mean-based) IMPLEMENTATION
 ###############################################################################
 def bsacd1_negloglik(params, X):
-    """
-    Negative log-likelihood for BSACD1 model.
-    Model:
-      X_i = μ_i * ε_i,   ε_i ~ RBS(1, τ)
-      log(μ_i) = β0 + α*log(μ_{i-1}) + β*(X_{i-1}/μ_{i-1})
-    """
     beta0, alpha, beta, tau = params
     n = len(X)
     mu = np.empty(n)
@@ -147,7 +138,7 @@ def compute_fitted_mu(params, X):
     return mu
 
 ###############################################################################
-# 5) INDICATOR CLASSES FOR HAWKES, ACDBVC, ACIBVC
+# 5) INDICATOR CLASSES
 ###############################################################################
 class HawkesBVC:
     def __init__(self, window=20, kappa=0.1, dof=0.25):
@@ -243,7 +234,7 @@ class ACIBVC:
         return df[["stamp", "bvc"]].copy()
 
 ###############################################################################
-# 6) TUNING FUNCTIONS
+# 6) TUNING FUNCTIONS (using correlation with log returns)
 ###############################################################################
 def tune_kappa_hawkes(df_prices, kappa_grid=None, scale=1e4):
     if kappa_grid is None:
@@ -312,29 +303,120 @@ st.write("Data range:", df["stamp"].min(), "to", df["stamp"].max())
 st.write("Number of rows:", len(df))
 
 # Tune parameters for each indicator and display results
-best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0])
+best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01,0.05,0.1,0.2,0.3,0.5,0.8,1.0])
 st.write("Best Hawkes kappa:", best_kappa_hawkes, "with correlation:", best_score_hawkes)
 
-best_kappa_acd, best_score_acd = tune_kappa_acd(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
+best_kappa_acd, best_score_acd = tune_kappa_acd(df, kappa_grid=[0.01,0.05,0.1,0.2,0.5,0.8,1.0])
 st.write("Best ACD kappa:", best_kappa_acd, "with correlation:", best_score_acd)
 
-best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
+best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01,0.05,0.1,0.2,0.5,0.8,1.0])
 st.write("Best ACI kappa:", best_kappa_aci, "with correlation:", best_score_aci)
 
-# For demonstration, plot the best HawkesBVC indicator.
-hawkes_best_model = HawkesBVC(window=20, kappa=best_kappa_hawkes)
-hawkes_bvc = hawkes_best_model.eval(df, scale=1e4)
-df_merged = df.merge(hawkes_bvc, on="stamp", how="inner")
+# ---------------------------------------------------------------------------
+# Indicator Evaluation: use selected indicator based on analysis_type
+# ---------------------------------------------------------------------------
+if analysis_type == "Hawkes BVC":
+    st.write("### Hawkes BVC Analysis")
+    indicator_title = "BVC"
+    indicator_df = HawkesBVC(window=20, kappa=best_kappa_hawkes).eval(df, scale=1e4)
+elif analysis_type == "ADC":
+    st.write("### Average Directional Change (ADC) Analysis")
+    threshold_param = st.slider("Directional Change Threshold (%)", min_value=0.1, max_value=5.0,
+                                  value=0.5, step=0.1) / 100
+    indicator_title = "ADC"
+    # Use the same directional_change function defined earlier
+    # Here we simply compute the ADC indicator without smoothing for demonstration.
+    df_temp = df.copy().sort_values("stamp")
+    adc_vals = directional_change(df_temp["close"].values, threshold=threshold_param)
+    # Scale ADC indicator
+    if np.max(np.abs(adc_vals)) != 0:
+        adc_vals = adc_vals / np.max(np.abs(adc_vals)) * 1e4
+    indicator_df = pd.DataFrame({"stamp": df_temp["stamp"], "bvc": adc_vals})
+elif analysis_type == "ACI":
+    st.write("### Accumulated Candle Index (ACI) Analysis")
+    indicator_title = "ACI"
+    df_temp = df.copy().sort_values("stamp")
+    klines = df_temp[["timestamp", "open", "high", "low", "close", "volume"]].values
+    aci_vals = accumulated_candle_index(klines, lookback=20)
+    if np.max(np.abs(aci_vals)) != 0:
+        aci_vals = aci_vals / np.max(np.abs(aci_vals)) * 1e4
+    indicator_df = pd.DataFrame({"stamp": df_temp["stamp"], "bvc": aci_vals})
+elif analysis_type == "BSACD1":
+    st.write("### BSACD1 Model Estimation on Durations")
+    df_reset = df.sort_values("stamp").reset_index(drop=True)
+    df_reset["duration"] = df_reset["stamp"].diff().dt.total_seconds()
+    durations = df_reset["duration"].dropna().values  # length = n-1
+    init_params = [0.0, 0.5, 0.0, 1.0]
+    res = minimize(bsacd1_negloglik, init_params, args=(durations,), method="L-BFGS-B")
+    st.write("Estimated BSACD1 parameters:", res.x)
+    fitted_mu = compute_fitted_mu(res.x, durations)
+    # Use the fitted μ starting from the second observation
+    indicator_df = pd.DataFrame({
+        "stamp": df_reset["stamp"].iloc[1:].reset_index(drop=True),
+        "bvc": fitted_mu[1:]
+    })
+    indicator_title = "Fitted μ"
 
-fig, ax = plt.subplots(figsize=(10, 4))
-ax.set_title(f"Hawkes BVC with best kappa = {best_kappa_hawkes:.3f}")
-ax.plot(df_merged["stamp"], df_merged["close"], label="Price", color="black")
-ax1 = ax
-ax2 = ax1.twinx()
-ax2.plot(df_merged["stamp"], df_merged["bvc"], label="BVC", color="red")
-ax1.set_ylabel("Price")
-ax2.set_ylabel("BVC")
-ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
-plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
-st.pyplot(fig)
+# ---------------------------------------------------------------------------
+# Merge indicator with price data for plotting
+# ---------------------------------------------------------------------------
+if analysis_type != "BSACD1":
+    df_merged = df.merge(indicator_df, on="stamp", how="inner")
+    df_merged = df_merged.sort_values("stamp")
+    df_merged["bvc"] = df_merged["bvc"].fillna(method="ffill").fillna(0)
+else:
+    df_merged = indicator_df.copy()
+
+###############################################################################
+# 8) PLOTTING THE CHART
+###############################################################################
+# For non-BSACD1 analyses, plot a gradient-colored price chart.
+if analysis_type != "BSACD1":
+    norm_bvc = plt.Normalize(-1, 1)
+    fig, ax = plt.subplots(figsize=(10, 4), dpi=120)
+    for i in range(len(df_merged)-1):
+        xvals = df_merged["stamp"].iloc[i:i+2]
+        yvals = df_merged["ScaledPrice"].iloc[i:i+2]
+        bvc_val = df_merged["bvc"].iloc[i]
+        color = plt.cm.bwr(norm_bvc(bvc_val))
+        ax.plot(xvals, yvals, color=color, linewidth=1.2)
+    ax.plot(df_merged["stamp"], df_merged["ScaledPrice_EMA"], color="black", linewidth=1, label="EMA(10)")
+    ax.plot(df_merged["stamp"], df_merged["vwap_transformed"], color="gray", linewidth=1, label="VWAP")
+    ax.set_xlabel("Time", fontsize=8)
+    ax.set_ylabel("Scaled Price", fontsize=8)
+    ax.set_title(f"Price with EMA & VWAP (Colored by {indicator_title})", fontsize=10)
+    ax.legend(fontsize=7)
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=7)
+    plt.setp(ax.get_yticklabels(), fontsize=7)
+    ax.set_ylim(df_merged["ScaledPrice"].min()-50, df_merged["ScaledPrice"].max()+50)
+    plt.tight_layout()
+    st.pyplot(fig)
+else:
+    # For BSACD1, plot the fitted μ (conditional mean durations)
+    fig, ax = plt.subplots(figsize=(10, 3), dpi=120)
+    ax.plot(df_merged["stamp"], df_merged["bvc"], color="green", linewidth=1.2, label="Fitted μ")
+    ax.set_xlabel("Time", fontsize=8)
+    ax.set_ylabel("Fitted μ", fontsize=8)
+    ax.set_title("BSACD1 Model: Fitted Conditional Mean Durations", fontsize=10)
+    ax.legend(fontsize=7)
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=7)
+    plt.setp(ax.get_yticklabels(), fontsize=7)
+    st.pyplot(fig)
+
+# Optionally, plot the raw indicator (for non-BSACD1)
+if analysis_type != "BSACD1":
+    fig_ind, ax_ind = plt.subplots(figsize=(10, 3), dpi=120)
+    ax_ind.plot(indicator_df["stamp"], indicator_df["bvc"], color="blue", linewidth=1, label=indicator_title)
+    ax_ind.set_xlabel("Time", fontsize=8)
+    ax_ind.set_ylabel(indicator_title, fontsize=8)
+    ax_ind.legend(fontsize=7)
+    ax_ind.set_title(f"{indicator_title} Over Time", fontsize=10)
+    ax_ind.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax_ind.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
+    plt.setp(ax_ind.get_xticklabels(), rotation=30, ha="right", fontsize=7)
+    plt.setp(ax_ind.get_yticklabels(), fontsize=7)
+    st.pyplot(fig_ind)
