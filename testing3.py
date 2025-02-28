@@ -32,7 +32,10 @@ global_lookback_label = st.sidebar.selectbox(
     key="global_lookback_label"
 )
 global_lookback_minutes = lookback_options[global_lookback_label]
-timeframe = st.sidebar.selectbox("Select Timeframe", ["1m", "5m", "15m", "1h"], key="timeframe_widget")
+timeframe = st.sidebar.selectbox(
+    "Select Timeframe", ["1m", "5m", "15m", "1h"],
+    key="timeframe_widget"
+)
 analysis_type = st.sidebar.selectbox(
     "Select Analysis Type",
     ["Hawkes BVC", "ADC", "ACI", "BSACD1"],
@@ -58,12 +61,12 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
         if last_timestamp <= cutoff_ts or len(ohlcv) < max_limit:
             break
         since = last_timestamp + 1
-    df = pd.DataFrame(all_ohlcv, columns=["timestamp","open","high","low","close","volume"])
+    df = pd.DataFrame(all_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["stamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
 
 ###############################################################################
-# 2) HELPER FUNCTIONS (Indicators, EMA, etc.)
+# 2) HELPER FUNCTIONS (EMA, directional change, etc.)
 ###############################################################################
 @njit(cache=True)
 def ema(arr_in: NDArray, window: int, alpha: Optional[float] = 0) -> NDArray:
@@ -72,7 +75,7 @@ def ema(arr_in: NDArray, window: int, alpha: Optional[float] = 0) -> NDArray:
     ewma = np.empty(n, dtype=np.float64)
     ewma[0] = arr_in[0]
     for i in range(1, n):
-        ewma[i] = (arr_in[i] * alpha) + (ewma[i-1] * (1 - alpha))
+        ewma[i] = (arr_in[i] * alpha) + (ewma[i - 1] * (1 - alpha))
     return ewma
 
 @njit(cache=True)
@@ -142,7 +145,7 @@ def bs_logpdf(x, kappa, sigma):
     return -np.log(2*kappa*x*np.sqrt(2*np.pi)) + np.log(np.sqrt(x/sigma)+np.sqrt(sigma/x)) - term/(2*kappa**2)
 
 ###############################################################################
-# 4) BSACD1 MODEL (Mean-based) IMPLEMENTATION
+# 4) BSACD1 MODEL (Mean-based) FUNCTIONS
 ###############################################################################
 def bsacd1_negloglik(params, X):
     beta0, alpha, beta, tau = params
@@ -184,7 +187,7 @@ class HawkesBVC:
     def eval(self, df: pd.DataFrame, scale=1e4):
         df = df.copy().sort_values("stamp")
         prices = df["close"]
-        cumr = np.log(prices/ prices.iloc[0])
+        cumr = np.log(prices / prices.iloc[0])
         r = cumr.diff().fillna(0.0)
         volume = df["volume"]
         sigma = r.rolling(self.window).std().fillna(0.0)
@@ -214,7 +217,7 @@ class ACDBVC:
         mean_dur = df["duration"].mean()
         std_dur = df["duration"].std() or 1e-10
         df["std_resid"] = (df["duration"] - mean_dur) / std_dur
-        df["price_change"] = np.log(df["close"]/df["close"].shift(1)).fillna(0)
+        df["price_change"] = np.log(df["close"] / df["close"].shift(1)).fillna(0)
         df["label"] = -df["std_resid"] * df["price_change"]
         df["weighted_volume"] = df["volume"] * df["label"]
         alpha_exp = np.exp(-self.kappa)
@@ -247,7 +250,7 @@ class ACIBVC:
         intensities = self.estimate_intensity(times, self.kappa)
         df = df.iloc[:len(intensities)]
         df["intensity"] = intensities
-        df["price_change"] = np.log(df["close"]/df["close"].shift(1)).fillna(0)
+        df["price_change"] = np.log(df["close"] / df["close"].shift(1)).fillna(0)
         df["label"] = df["intensity"] * df["price_change"]
         df["weighted_volume"] = df["volume"] * df["label"]
         alpha_exp = np.exp(-self.kappa)
@@ -325,24 +328,35 @@ def tune_kappa_aci(df_prices, kappa_grid=None, scale=1e5):
 ###############################################################################
 st.header("Price & Indicator Analysis")
 
-# Fetch data (e.g., last 12 hours)
+# Fetch data (last 12 hours)
 df = fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=720)
 df = df.sort_values("stamp").reset_index(drop=True)
 st.write("Data range:", df["stamp"].min(), "to", df["stamp"].max())
 st.write("Number of rows:", len(df))
 
-# Tune parameters for each indicator and display results
-best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01,0.05,0.1,0.2,0.3,0.5,0.8,1.0])
+# Compute additional fields for plotting:
+df["ScaledPrice"] = np.log(df["close"] / df["close"].iloc[0]) * 1e4
+df["ScaledPrice_EMA"] = ema(df["ScaledPrice"].values, window=10)
+df["cum_vol"] = df["volume"].cumsum()
+df["cum_pv"] = (df["close"] * df["volume"]).cumsum()
+df["vwap"] = df["cum_pv"] / df["cum_vol"]
+if df["vwap"].iloc[0] == 0 or not np.isfinite(df["vwap"].iloc[0]):
+    df["vwap_transformed"] = df["ScaledPrice"]
+else:
+    df["vwap_transformed"] = np.log(df["vwap"] / df["vwap"].iloc[0]) * 1e4
+
+# Tune parameters for each indicator
+best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0])
 st.write("Best Hawkes kappa:", best_kappa_hawkes, "with correlation:", best_score_hawkes)
 
-best_kappa_acd, best_score_acd = tune_kappa_acd(df, kappa_grid=[0.01,0.05,0.1,0.2,0.5,0.8,1.0])
+best_kappa_acd, best_score_acd = tune_kappa_acd(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
 st.write("Best ACD kappa:", best_kappa_acd, "with correlation:", best_score_acd)
 
-best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01,0.05,0.1,0.2,0.5,0.8,1.0])
+best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
 st.write("Best ACI kappa:", best_kappa_aci, "with correlation:", best_score_aci)
 
 # ---------------------------------------------------------------------------
-# Indicator Evaluation: Choose based on analysis_type
+# Indicator Evaluation: Select based on analysis_type
 # ---------------------------------------------------------------------------
 if analysis_type == "Hawkes BVC":
     st.write("### Hawkes BVC Analysis")
@@ -382,7 +396,9 @@ elif analysis_type == "BSACD1":
     })
     indicator_title = "Fitted μ"
 
+# ---------------------------------------------------------------------------
 # Merge indicator with price data (for non-BSACD1, merge on stamp)
+# ---------------------------------------------------------------------------
 if analysis_type != "BSACD1":
     df_merged = df.merge(indicator_df, on="stamp", how="inner")
     df_merged = df_merged.sort_values("stamp")
@@ -394,6 +410,7 @@ else:
 # 8) PLOTTING THE CHART
 ###############################################################################
 if analysis_type != "BSACD1":
+    # Plot gradient-colored price chart
     norm_bvc = plt.Normalize(-1, 1)
     fig, ax = plt.subplots(figsize=(10, 4), dpi=120)
     for i in range(len(df_merged)-1):
@@ -416,6 +433,7 @@ if analysis_type != "BSACD1":
     plt.tight_layout()
     st.pyplot(fig)
 else:
+    # For BSACD1, plot the fitted μ (conditional mean durations)
     fig, ax = plt.subplots(figsize=(10, 3), dpi=120)
     ax.plot(df_merged["stamp"], df_merged["bvc"], color="green", linewidth=1.2, label="Fitted μ")
     ax.set_xlabel("Time", fontsize=8)
@@ -428,6 +446,7 @@ else:
     plt.setp(ax.get_yticklabels(), fontsize=7)
     st.pyplot(fig)
 
+# Optionally, plot the raw indicator series for non-BSACD1 types.
 if analysis_type != "BSACD1":
     fig_ind, ax_ind = plt.subplots(figsize=(10, 3), dpi=120)
     ax_ind.plot(indicator_df["stamp"], indicator_df["bvc"], color="blue", linewidth=1, label=indicator_title)
