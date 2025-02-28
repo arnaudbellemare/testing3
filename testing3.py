@@ -8,6 +8,7 @@ from scipy.optimize import minimize
 from numba import njit
 from numpy.typing import NDArray
 from typing import Optional
+import streamlit as st
 
 ###############################################################################
 # 1) FETCH DATA FUNCTIONS
@@ -31,12 +32,12 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
         if last_timestamp <= cutoff_ts or len(ohlcv) < max_limit:
             break
         since = last_timestamp + 1
-    df = pd.DataFrame(all_ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(all_ohlcv, columns=["timestamp","open","high","low","close","volume"])
     df["stamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
 
 ###############################################################################
-# 2) HELPER FUNCTIONS (including indicator functions)
+# 2) HELPER FUNCTIONS (Indicators, EMA, etc.)
 ###############################################################################
 @njit(cache=True)
 def ema(arr_in: NDArray, window: int, alpha: Optional[float] = 0) -> NDArray:
@@ -100,7 +101,7 @@ def accumulated_candle_index(klines: NDArray, lookback: int = 20) -> NDArray:
     return aci
 
 ###############################################################################
-# 3) BS DISTRIBUTION FUNCTIONS (for BSACD1)
+# 3) BS DISTRIBUTION FUNCTIONS (for BSACD1 model)
 ###############################################################################
 def bs_pdf(x, kappa, sigma):
     if x <= 0:
@@ -115,7 +116,7 @@ def bs_logpdf(x, kappa, sigma):
     return -np.log(2*kappa*x*np.sqrt(2*np.pi)) + np.log(np.sqrt(x/sigma)+np.sqrt(sigma/x)) - term/(2*kappa**2)
 
 ###############################################################################
-# 4) BSACD1 MODEL (MEAN-BASED) IMPLEMENTATION
+# 4) BSACD1 MODEL (Mean-based) FUNCTIONS
 ###############################################################################
 def bsacd1_negloglik(params, X):
     """
@@ -123,8 +124,6 @@ def bsacd1_negloglik(params, X):
     Model:
       X_i = μ_i * ε_i,   ε_i ~ RBS(1, τ)
       log(μ_i) = β0 + α*log(μ_{i-1}) + β*(X_{i-1}/μ_{i-1})
-    The density for observation i is:
-      f(X_i; μ_i, τ) = (1/μ_i)*BS_pdf(X_i/μ_i; τ, 1)
     """
     beta0, alpha, beta, tau = params
     n = len(X)
@@ -228,7 +227,7 @@ class ACIBVC:
         intensities = self.estimate_intensity(times, self.kappa)
         df = df.iloc[:len(intensities)]
         df["intensity"] = intensities
-        df["price_change"] = np.log(df["close"]/df["close"].shift(1)).fillna(0)
+        df["price_change"] = np.log(df["close"] / df["close"].shift(1)).fillna(0)
         df["label"] = df["intensity"] * df["price_change"]
         df["weighted_volume"] = df["volume"] * df["label"]
         alpha_exp = np.exp(-self.kappa)
@@ -244,7 +243,7 @@ class ACIBVC:
         return df[["stamp", "bvc"]].copy()
 
 ###############################################################################
-# 6) TUNE KAPPA BY CORRELATION WITH LOG RETURNS
+# 6) TUNING FUNCTIONS
 ###############################################################################
 def tune_kappa_hawkes(df_prices, kappa_grid=None, scale=1e4):
     if kappa_grid is None:
@@ -302,38 +301,40 @@ def tune_kappa_aci(df_prices, kappa_grid=None, scale=1e5):
     return best_kappa, best_score
 
 ###############################################################################
-# 7) MAIN SCRIPT
+# 7) MAIN SCRIPT (STREAMLIT APP)
 ###############################################################################
-if __name__ == "__main__":
-    # 1) Fetch data (last 12 hours)
-    df = fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=720)
-    df.sort_values("stamp", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    print("Fetched data range:", df["stamp"].min(), "to", df["stamp"].max())
-    print("Number of rows:", len(df))
-    
-    # 2) Tune parameters for each indicator
-    best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0])
-    print("Best Hawkes kappa:", best_kappa_hawkes, "with correlation:", best_score_hawkes)
-    
-    best_kappa_acd, best_score_acd = tune_kappa_acd(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
-    print("Best ACD kappa:", best_kappa_acd, "with correlation:", best_score_acd)
-    
-    best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
-    print("Best ACI kappa:", best_kappa_aci, "with correlation:", best_score_aci)
-    
-    # 3) (Optional) Plot the best result for HawkesBVC
-    hawkes_best_model = HawkesBVC(window=20, kappa=best_kappa_hawkes)
-    hawkes_bvc = hawkes_best_model.eval(df, scale=1e4)
-    df_merged = df.merge(hawkes_bvc, on="stamp", how="inner")
-    
-    plt.figure(figsize=(10,4))
-    plt.title(f"Hawkes BVC with best kappa = {best_kappa_hawkes:.3f}")
-    plt.plot(df_merged["stamp"], df_merged["close"], label="Price", color="black")
-    ax1 = plt.gca()
-    ax2 = ax1.twinx()
-    ax2.plot(df_merged["stamp"], df_merged["bvc"], label="BVC", color="red")
-    ax1.set_ylabel("Price")
-    ax2.set_ylabel("BVC")
-    plt.legend()
-    plt.show()
+st.header("Price & Indicator Analysis")
+
+# Fetch data (e.g., last 12 hours)
+df = fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=720)
+df = df.sort_values("stamp").reset_index(drop=True)
+st.write("Data range:", df["stamp"].min(), "to", df["stamp"].max())
+st.write("Number of rows:", len(df))
+
+# Tune parameters for each indicator and display results
+best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0])
+st.write("Best Hawkes kappa:", best_kappa_hawkes, "with correlation:", best_score_hawkes)
+
+best_kappa_acd, best_score_acd = tune_kappa_acd(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
+st.write("Best ACD kappa:", best_kappa_acd, "with correlation:", best_score_acd)
+
+best_kappa_aci, best_score_aci = tune_kappa_aci(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.5, 0.8, 1.0])
+st.write("Best ACI kappa:", best_kappa_aci, "with correlation:", best_score_aci)
+
+# For demonstration, plot the best HawkesBVC indicator.
+hawkes_best_model = HawkesBVC(window=20, kappa=best_kappa_hawkes)
+hawkes_bvc = hawkes_best_model.eval(df, scale=1e4)
+df_merged = df.merge(hawkes_bvc, on="stamp", how="inner")
+
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.set_title(f"Hawkes BVC with best kappa = {best_kappa_hawkes:.3f}")
+ax.plot(df_merged["stamp"], df_merged["close"], label="Price", color="black")
+ax1 = ax
+ax2 = ax1.twinx()
+ax2.plot(df_merged["stamp"], df_merged["bvc"], label="BVC", color="red")
+ax1.set_ylabel("Price")
+ax2.set_ylabel("BVC")
+ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
+plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+st.pyplot(fig)
