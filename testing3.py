@@ -385,16 +385,18 @@ elif analysis_type == "BSACD1":
     st.write("### BSACD1 Model Estimation on Durations")
     df_reset = df.sort_values("stamp").reset_index(drop=True)
     df_reset["duration"] = df_reset["stamp"].diff().dt.total_seconds()
-    durations = df_reset["duration"].dropna().values  # length = N-1
+    durations = df_reset["duration"].dropna().values  # length = N - 1
     init_params = [0.0, 0.5, 0.0, 1.0]
     res = minimize(bsacd1_negloglik, init_params, args=(durations,), method="L-BFGS-B")
     st.write("Estimated BSACD1 parameters:", res.x)
-    fitted_mu = compute_fitted_mu(res.x, durations)  # fitted_mu length should equal len(durations)
+    fitted_mu = compute_fitted_mu(res.x, durations)  # length = len(durations)
+    # Slice the stamps to match the length of fitted_mu:
     indicator_df = pd.DataFrame({
-        "stamp": df_reset["stamp"].iloc[1:].reset_index(drop=True),
-        "bvc": fitted_mu   # Use the fitted_mu as is
+        "stamp": df_reset["stamp"].iloc[1:1+len(fitted_mu)].reset_index(drop=True),
+        "bvc": fitted_mu
     })
     indicator_title = "Fitted μ"
+
 
 # ---------------------------------------------------------------------------
 # Merge indicator with price data (for non-BSACD1, merge on stamp)
