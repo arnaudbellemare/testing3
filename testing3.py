@@ -36,7 +36,7 @@ timeframe = st.sidebar.selectbox(
     "Select Timeframe", ["1m", "5m", "15m", "1h"],
     key="timeframe_widget"
 )
-# Options: "Hawkes BVC", "ADC", "ACI", "BSACD1"
+# Options: "Hawkes BVC", "ADC" (here meaning our ACD model), "ACI", "BSACD1"
 analysis_type = st.sidebar.selectbox(
     "Select Analysis Type",
     ["Hawkes BVC", "ADC", "ACI", "BSACD1"],
@@ -62,12 +62,12 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
         if last_timestamp <= cutoff_ts or len(ohlcv) < max_limit:
             break
         since = last_timestamp + 1
-    df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["stamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
 
 ###############################################################################
-# 2) HELPER FUNCTIONS (EMA, directional change, accumulated candle index)
+# 2) HELPER FUNCTIONS (EMA and accumulated candle index)
 ###############################################################################
 @njit(cache=True)
 def ema(arr_in: NDArray, window: int, alpha: Optional[float] = 0) -> NDArray:
@@ -110,25 +110,7 @@ def accumulated_candle_index(klines: NDArray, lookback: int = 20) -> NDArray:
     return aci
 
 ###############################################################################
-# 3) NEW ACD INDICATOR FUNCTION (similar to ACI accumulation)
-###############################################################################
-def acd_indicator(timestamps, kappa):
-    """
-    Computes an ACD indicator based solely on durations between timestamps,
-    accumulating them with an exponential decay.
-    """
-    # Convert timestamps to seconds since first timestamp
-    times = (timestamps - timestamps[0]).astype('timedelta64[s]').astype(np.float64)
-    durations = np.diff(times)  # length = N-1
-    adi = np.zeros_like(durations)
-    if len(durations) > 0:
-        adi[0] = durations[0]
-        for i in range(1, len(durations)):
-            adi[i] = adi[i-1] * np.exp(-kappa * durations[i]) + durations[i]
-    return adi
-
-###############################################################################
-# 4) BS DISTRIBUTION FUNCTIONS (for BSACD1)
+# 3) BS DISTRIBUTION FUNCTIONS (for BSACD1)
 ###############################################################################
 def bs_pdf(x, kappa, sigma):
     if x <= 0:
@@ -143,7 +125,7 @@ def bs_logpdf(x, kappa, sigma):
     return -np.log(2*kappa*x*np.sqrt(2*np.pi)) + np.log(np.sqrt(x/sigma)+np.sqrt(sigma/x)) - term/(2*kappa**2)
 
 ###############################################################################
-# 5) BSACD1 MODEL (Mean-based) FUNCTIONS
+# 4) BSACD1 MODEL (Mean-based) FUNCTIONS
 ###############################################################################
 def bsacd1_negloglik(params, X):
     beta0, alpha, beta, tau = params
@@ -166,6 +148,35 @@ def compute_fitted_mu(params, X):
     for i in range(1, n):
         mu[i] = np.exp(beta0 + alpha * np.log(mu[i-1]) + beta * (X[i-1]/mu[i-1]))
     return mu
+
+###############################################################################
+# 5) NEW ACD INDICATOR (Linear ACD(1,1) Model)
+###############################################################################
+class ACDAIndicator:
+    def __init__(self, omega=1.0, alpha=0.5, beta=0.3):
+        self.omega = omega
+        self.alpha = alpha
+        self.beta = beta
+
+    def eval(self, df: pd.DataFrame, scale=1e4):
+        df = df.copy().sort_values("stamp")
+        # Compute durations (in seconds) between successive timestamps
+        df["duration"] = df["stamp"].diff().dt.total_seconds()
+        durations = df["duration"].dropna().values  # length = N - 1
+        if len(durations) == 0:
+            return pd.DataFrame({"stamp": [], "acd": []})
+        mu = np.empty(len(durations))
+        mu[0] = np.median(durations)
+        for i in range(1, len(durations)):
+            mu[i] = self.omega + self.alpha * durations[i-1] + self.beta * mu[i-1]
+        # Scale the indicator if needed
+        if np.max(np.abs(mu)) != 0:
+            mu = mu / np.max(np.abs(mu)) * scale
+        indicator_df = pd.DataFrame({
+            "stamp": df["stamp"].iloc[1:].reset_index(drop=True),
+            "acd": mu
+        })
+        return indicator_df
 
 ###############################################################################
 # 6) INDICATOR CLASSES (HawkesBVC, ACDBVC, ACIBVC)
@@ -284,7 +295,7 @@ def tune_kappa_hawkes(df_prices, kappa_grid=None, scale=1e4):
     return best_kappa, best_score
 
 def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e4):
-    # Tune using our new acd_indicator function
+    # For our simple ACD indicator, we use the acd_indicator function defined below
     if kappa_grid is None:
         kappa_grid = [0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5]
     df_prices = df_prices.copy().sort_values("stamp")
@@ -292,11 +303,10 @@ def tune_kappa_acd(df_prices, kappa_grid=None, scale=1e4):
     best_kappa = None
     best_score = -999.0
     for k in kappa_grid:
-        # Compute ACD indicator from timestamps using our new function
-        adi_vals = acd_indicator(df_prices["stamp"].values, kappa=k)
+        acd_vals = acd_indicator(df_prices["stamp"].values, kappa=k)
         temp_df = pd.DataFrame({
             "stamp": df_prices["stamp"].iloc[1:].reset_index(drop=True),
-            "bvc": adi_vals
+            "bvc": acd_vals
         })
         merged = df_prices.merge(temp_df, on="stamp", how="inner")
         corr_val = merged[["log_return", "bvc"]].corr().iloc[0, 1]
@@ -325,7 +335,36 @@ def tune_kappa_aci(df_prices, kappa_grid=None, scale=1e5):
     return best_kappa, best_score
 
 ###############################################################################
-# 8) MAIN SCRIPT (STREAMLIT APP)
+# 8) NEW ACD INDICATOR (Simple linear ACD(1,1) Model)
+###############################################################################
+class ACDAIndicator:
+    def __init__(self, omega=1.0, alpha=0.5, beta=0.3):
+        self.omega = omega
+        self.alpha = alpha
+        self.beta = beta
+
+    def eval(self, df: pd.DataFrame, scale=1e4):
+        df = df.copy().sort_values("stamp")
+        # Compute durations (in seconds) between successive timestamps
+        df["duration"] = df["stamp"].diff().dt.total_seconds()
+        durations = df["duration"].dropna().values  # length = N-1
+        if len(durations) == 0:
+            return pd.DataFrame({"stamp": [], "acd": []})
+        mu = np.empty(len(durations))
+        mu[0] = np.median(durations)
+        for i in range(1, len(durations)):
+            mu[i] = self.omega + self.alpha * durations[i-1] + self.beta * mu[i-1]
+        # Scale the indicator
+        if np.max(np.abs(mu)) != 0:
+            mu = mu / np.max(np.abs(mu)) * scale
+        indicator_df = pd.DataFrame({
+            "stamp": df["stamp"].iloc[1:].reset_index(drop=True),
+            "acd": mu
+        })
+        return indicator_df
+
+###############################################################################
+# 9) MAIN SCRIPT (STREAMLIT APP)
 ###############################################################################
 st.header("Price & Indicator Analysis")
 
@@ -364,18 +403,14 @@ if analysis_type == "Hawkes BVC":
     indicator_title = "BVC"
     indicator_df = HawkesBVC(window=20, kappa=best_kappa_hawkes).eval(df, scale=1e4)
 elif analysis_type == "ADC":
+    # Here ADC means our ACD model in the ACD(1,1) linear form implemented in ACDAIndicator.
     st.write("### ACD (Autoregressive Conditional Duration) Analysis")
     indicator_title = "ACD"
-    # Compute ACD indicator using our acd_indicator function
-    df_temp = df.copy().sort_values("stamp")
-    acd_vals = acd_indicator(df_temp["stamp"].values, kappa=best_kappa_acd)
-    if np.max(np.abs(acd_vals)) != 0:
-        acd_vals = acd_vals / np.max(np.abs(acd_vals)) * 1e4
-    # Since acd_indicator returns N-1 values, use the stamps from index 1 onward
-    indicator_df = pd.DataFrame({
-        "stamp": df_temp["stamp"].iloc[1:].reset_index(drop=True),
-        "bvc": acd_vals
-    })
+    # Let the user adjust omega, alpha, and beta
+    omega = st.slider("omega", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
+    alpha_par = st.slider("alpha", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
+    beta_par = st.slider("beta", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
+    indicator_df = ACDAIndicator(omega=omega, alpha=alpha_par, beta=beta_par).eval(df, scale=1e4)
 elif analysis_type == "ACI":
     st.write("### Accumulated Candle Index (ACI) Analysis")
     indicator_title = "ACI"
@@ -393,8 +428,8 @@ elif analysis_type == "BSACD1":
     init_params = [0.0, 0.5, 0.0, 1.0]
     res = minimize(bsacd1_negloglik, init_params, args=(durations,), method="L-BFGS-B")
     st.write("Estimated BSACD1 parameters:", res.x)
-    fitted_mu = compute_fitted_mu(res.x, durations)  # length should equal len(durations)
-    # Use stamps from index 1 to match fitted_mu length
+    fitted_mu = compute_fitted_mu(res.x, durations)  # length = len(durations)
+    # Use stamps from index 1 to match fitted_mu length exactly
     indicator_df = pd.DataFrame({
         "stamp": df_reset["stamp"].iloc[1:1+len(fitted_mu)].reset_index(drop=True),
         "bvc": fitted_mu
@@ -412,7 +447,7 @@ else:
     df_merged = indicator_df.copy()
 
 ###############################################################################
-# 8) PLOTTING THE CHART
+# 10) PLOTTING THE CHART
 ###############################################################################
 if analysis_type != "BSACD1":
     norm_bvc = plt.Normalize(-1, 1)
