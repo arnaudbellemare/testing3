@@ -109,21 +109,6 @@ def accumulated_candle_index(klines: NDArray, lookback: int = 20) -> NDArray:
     return aci
 
 ###############################################################################
-# 3) BS DISTRIBUTION FUNCTIONS (for BSACD1 - not used here)
-###############################################################################
-def bs_pdf(x, kappa, sigma):
-    if x <= 0:
-        return 0
-    term = (np.sqrt(x/sigma) - np.sqrt(sigma/x))**2
-    return 1/(2 * kappa * x * np.sqrt(2*np.pi)) * (np.sqrt(x/sigma)+np.sqrt(sigma/x)) * np.exp(-term/(2*kappa**2))
-
-def bs_logpdf(x, kappa, sigma):
-    if x <= 0:
-        return -np.inf
-    term = (np.sqrt(x/sigma) - np.sqrt(sigma/x))**2
-    return -np.log(2*kappa*x*np.sqrt(2*np.pi)) + np.log(np.sqrt(x/sigma)+np.sqrt(sigma/x)) - term/(2*kappa**2)
-
-###############################################################################
 # 4) INDICATOR CLASSES (HawkesBVC and ACIBVC)
 ###############################################################################
 class HawkesBVC:
@@ -284,13 +269,14 @@ df_merged["bvc"] = df_merged["bvc"].fillna(method="ffill").fillna(0)
 ###############################################################################
 # 7) PLOTTING THE CHART
 ###############################################################################
+# Use reversed colormap: bwr_r to invert color from red-to-blue
 norm_bvc = plt.Normalize(-1, 1)
 fig, ax = plt.subplots(figsize=(10, 4), dpi=120)
 for i in range(len(df_merged)-1):
     xvals = df_merged["stamp"].iloc[i:i+2]
     yvals = df_merged["ScaledPrice"].iloc[i:i+2]
     bvc_val = df_merged["bvc"].iloc[i]
-    color = plt.cm.bwr(norm_bvc(bvc_val))
+    color = plt.cm.bwr_r(norm_bvc(bvc_val))
     ax.plot(xvals, yvals, color=color, linewidth=1.2)
 ax.plot(df_merged["stamp"], df_merged["ScaledPrice_EMA"], color="black", linewidth=1, label="EMA(10)")
 ax.plot(df_merged["stamp"], df_merged["vwap_transformed"], color="gray", linewidth=1, label="VWAP")
