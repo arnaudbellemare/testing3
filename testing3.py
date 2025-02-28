@@ -51,7 +51,7 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
     cutoff_ts = now_ms - lookback_minutes * 60 * 1000
     all_ohlcv = []
     since = cutoff_ts
-    max_limit = 1440
+    max_limit = 1440  # max candles per request
     while True:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=max_limit)
         if not ohlcv:
@@ -61,7 +61,7 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
         if last_timestamp <= cutoff_ts or len(ohlcv) < max_limit:
             break
         since = last_timestamp + 1
-    df = pd.DataFrame(all_ohlcv, columns=["timestamp","open","high","low","close","volume"])
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["stamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     return df
 
@@ -80,6 +80,7 @@ def ema(arr_in: NDArray, window: int, alpha: Optional[float] = 0) -> NDArray:
 
 @njit(cache=True)
 def directional_change(prices: NDArray, threshold: float = 0.005) -> NDArray:
+    # (This function is now unused for ADC)
     n = len(prices)
     adc = np.zeros(n, dtype=np.float64)
     if n < 2:
@@ -170,7 +171,18 @@ def compute_fitted_mu(params, X):
     return mu
 
 ###############################################################################
-# 5) INDICATOR CLASSES
+# 5) SIMPLE ACD MODEL (Linear ACD(1,1))
+###############################################################################
+def simple_acd(durations, omega, alpha, beta):
+    n = len(durations)
+    mu = np.empty(n)
+    mu[0] = np.median(durations)
+    for i in range(1, n):
+        mu[i] = omega + alpha * durations[i-1] + beta * mu[i-1]
+    return mu
+
+###############################################################################
+# 6) INDICATOR CLASSES
 ###############################################################################
 class HawkesBVC:
     def __init__(self, window=20, kappa=0.1, dof=0.25):
@@ -266,7 +278,7 @@ class ACIBVC:
         return df[["stamp", "bvc"]].copy()
 
 ###############################################################################
-# 6) TUNING FUNCTIONS (using correlation with log returns)
+# 7) TUNING FUNCTIONS (using correlation with log returns)
 ###############################################################################
 def tune_kappa_hawkes(df_prices, kappa_grid=None, scale=1e4):
     if kappa_grid is None:
@@ -324,7 +336,7 @@ def tune_kappa_aci(df_prices, kappa_grid=None, scale=1e5):
     return best_kappa, best_score
 
 ###############################################################################
-# 7) MAIN SCRIPT (STREAMLIT APP)
+# 8) MAIN SCRIPT (STREAMLIT APP)
 ###############################################################################
 st.header("Price & Indicator Analysis")
 
@@ -363,15 +375,21 @@ if analysis_type == "Hawkes BVC":
     indicator_title = "BVC"
     indicator_df = HawkesBVC(window=20, kappa=best_kappa_hawkes).eval(df, scale=1e4)
 elif analysis_type == "ADC":
-    st.write("### Average Directional Change (ADC) Analysis")
-    threshold_param = st.slider("Directional Change Threshold (%)", min_value=0.1, max_value=5.0,
-                                  value=0.5, step=0.1) / 100
-    indicator_title = "ADC"
-    df_temp = df.copy().sort_values("stamp")
-    adc_vals = directional_change(df_temp["close"].values, threshold=threshold_param)
-    if np.max(np.abs(adc_vals)) != 0:
-        adc_vals = adc_vals / np.max(np.abs(adc_vals)) * 1e4
-    indicator_df = pd.DataFrame({"stamp": df_temp["stamp"], "bvc": adc_vals})
+    st.write("### ACD (Autoregressive Conditional Duration) Analysis")
+    indicator_title = "Fitted μ (ACD)"
+    # For ACD, compute durations from timestamps
+    df_reset = df.sort_values("stamp").reset_index(drop=True)
+    df_reset["duration"] = df_reset["stamp"].diff().dt.total_seconds()
+    durations = df_reset["duration"].dropna().values  # length = N-1
+    # User inputs for simple ACD model parameters
+    omega = st.slider("omega", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
+    alpha_par = st.slider("alpha", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
+    beta_par = st.slider("beta", min_value=0.0, max_value=1.0, value=0.3, step=0.05)
+    fitted_mu = simple_acd(durations, omega, alpha_par, beta_par)
+    indicator_df = pd.DataFrame({
+        "stamp": df_reset["stamp"].iloc[1:].reset_index(drop=True),
+        "bvc": fitted_mu
+    })
 elif analysis_type == "ACI":
     st.write("### Accumulated Candle Index (ACI) Analysis")
     indicator_title = "ACI"
@@ -385,18 +403,17 @@ elif analysis_type == "BSACD1":
     st.write("### BSACD1 Model Estimation on Durations")
     df_reset = df.sort_values("stamp").reset_index(drop=True)
     df_reset["duration"] = df_reset["stamp"].diff().dt.total_seconds()
-    durations = df_reset["duration"].dropna().values  # length = N - 1
+    durations = df_reset["duration"].dropna().values  # length = N-1
     init_params = [0.0, 0.5, 0.0, 1.0]
     res = minimize(bsacd1_negloglik, init_params, args=(durations,), method="L-BFGS-B")
     st.write("Estimated BSACD1 parameters:", res.x)
-    fitted_mu = compute_fitted_mu(res.x, durations)  # length = len(durations)
-    # Slice the stamps to match the length of fitted_mu:
+    fitted_mu = compute_fitted_mu(res.x, durations)  # length should equal len(durations)
+    # Here we align the stamps with the fitted_mu vector
     indicator_df = pd.DataFrame({
         "stamp": df_reset["stamp"].iloc[1:1+len(fitted_mu)].reset_index(drop=True),
         "bvc": fitted_mu
     })
-    indicator_title = "Fitted μ"
-
+    indicator_title = "Fitted μ (BSACD1)"
 
 # ---------------------------------------------------------------------------
 # Merge indicator with price data (for non-BSACD1, merge on stamp)
@@ -431,30 +448,4 @@ if analysis_type != "BSACD1":
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=7)
     plt.setp(ax.get_yticklabels(), fontsize=7)
     ax.set_ylim(df_merged["ScaledPrice"].min()-50, df_merged["ScaledPrice"].max()+50)
-    plt.tight_layout()
-    st.pyplot(fig)
-else:
-    fig, ax = plt.subplots(figsize=(10, 3), dpi=120)
-    ax.plot(df_merged["stamp"], df_merged["bvc"], color="green", linewidth=1.2, label="Fitted μ")
-    ax.set_xlabel("Time", fontsize=8)
-    ax.set_ylabel("Fitted μ", fontsize=8)
-    ax.set_title("BSACD1 Model: Fitted Conditional Mean Durations", fontsize=10)
-    ax.legend(fontsize=7)
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
-    plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=7)
-    plt.setp(ax.get_yticklabels(), fontsize=7)
-    st.pyplot(fig)
-
-if analysis_type != "BSACD1":
-    fig_ind, ax_ind = plt.subplots(figsize=(10, 3), dpi=120)
-    ax_ind.plot(indicator_df["stamp"], indicator_df["bvc"], color="blue", linewidth=1, label=indicator_title)
-    ax_ind.set_xlabel("Time", fontsize=8)
-    ax_ind.set_ylabel(indicator_title, fontsize=8)
-    ax_ind.legend(fontsize=7)
-    ax_ind.set_title(f"{indicator_title} Over Time", fontsize=10)
-    ax_ind.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax_ind.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d %H:%M"))
-    plt.setp(ax_ind.get_xticklabels(), rotation=30, ha="right", fontsize=7)
-    plt.setp(ax_ind.get_yticklabels(), fontsize=7)
-    st.pyplot(fig_ind)
+    plt.tight_layou
