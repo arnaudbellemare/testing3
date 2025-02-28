@@ -66,7 +66,7 @@ def fetch_data(symbol="BTC/USD", timeframe="1m", lookback_minutes=1440):
     return df
 
 ###############################################################################
-# 2) HELPER FUNCTIONS (EMA, directional change, etc.)
+# 2) HELPER FUNCTIONS (EMA, directional change, accumulated candle index)
 ###############################################################################
 @njit(cache=True)
 def ema(arr_in: NDArray, window: int, alpha: Optional[float] = 0) -> NDArray:
@@ -345,7 +345,7 @@ if df["vwap"].iloc[0] == 0 or not np.isfinite(df["vwap"].iloc[0]):
 else:
     df["vwap_transformed"] = np.log(df["vwap"] / df["vwap"].iloc[0]) * 1e4
 
-# Tune parameters for each indicator and display results
+# Tune parameters for each indicator
 best_kappa_hawkes, best_score_hawkes = tune_kappa_hawkes(df, kappa_grid=[0.01, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0])
 st.write("Best Hawkes kappa:", best_kappa_hawkes, "with correlation:", best_score_hawkes)
 
@@ -385,15 +385,14 @@ elif analysis_type == "BSACD1":
     st.write("### BSACD1 Model Estimation on Durations")
     df_reset = df.sort_values("stamp").reset_index(drop=True)
     df_reset["duration"] = df_reset["stamp"].diff().dt.total_seconds()
-    durations = df_reset["duration"].dropna().values  # length = n-1
+    durations = df_reset["duration"].dropna().values  # length = N-1
     init_params = [0.0, 0.5, 0.0, 1.0]
     res = minimize(bsacd1_negloglik, init_params, args=(durations,), method="L-BFGS-B")
     st.write("Estimated BSACD1 parameters:", res.x)
-    fitted_mu = compute_fitted_mu(res.x, durations)
-    # Use fitted_mu as is (length equals durations length)
+    fitted_mu = compute_fitted_mu(res.x, durations)  # fitted_mu length should equal len(durations)
     indicator_df = pd.DataFrame({
         "stamp": df_reset["stamp"].iloc[1:].reset_index(drop=True),
-        "bvc": fitted_mu
+        "bvc": fitted_mu   # Use the fitted_mu as is
     })
     indicator_title = "Fitted μ"
 
