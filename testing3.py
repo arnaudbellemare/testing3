@@ -127,62 +127,7 @@ def bs_logpdf(x, kappa, sigma):
     term = (np.sqrt(x/sigma) - np.sqrt(sigma/x))**2
     return -np.log(2*kappa*x*np.sqrt(2*np.pi)) + np.log(np.sqrt(x/sigma)+np.sqrt(sigma/x)) - term/(2*kappa**2)
 
-###############################################################################
-# 4) BSACD1 MODEL (Mean-based) FUNCTIONS
-###############################################################################
-def bsacd1_negloglik(params, X):
-    beta0, alpha, beta, tau = params
-    n = len(X)
-    mu = np.empty(n)
-    mu[0] = np.median(X)
-    neglog = 0.0
-    for i in range(1, n):
-        mu[i] = np.exp(beta0 + alpha * np.log(mu[i-1]) + beta * (X[i-1]/mu[i-1]))
-        ratio = X[i] / mu[i]
-        ll = bs_logpdf(ratio, tau, 1) - np.log(mu[i])
-        neglog -= ll
-    return neglog
 
-def compute_fitted_mu(params, X):
-    beta0, alpha, beta, tau = params
-    n = len(X)
-    mu = np.empty(n)
-    mu[0] = np.median(X)
-    for i in range(1, n):
-        mu[i] = np.exp(beta0 + alpha * np.log(mu[i-1]) + beta * (X[i-1]/mu[i-1]))
-    return mu
-
-###############################################################################
-# 5) ACD INDICATOR (Autoregressive Conditional Duration)
-###############################################################################
-class ACDIndicator:
-    def __init__(self, omega=1.0, alpha=0.5, beta=0.3):
-        self.omega = omega
-        self.alpha = alpha
-        self.beta = beta
-
-    def eval(self, df: pd.DataFrame, scale=1e4):
-        df = df.copy().sort_values("stamp")
-        # Compute durations (in seconds) between successive timestamps.
-        # This yields an array of length N-1 if there are N timestamps.
-        df["duration"] = df["stamp"].diff().dt.total_seconds()
-        durations = df["duration"].dropna().values
-        if len(durations) == 0:
-            return pd.DataFrame({"stamp": [], "bvc": []})
-        # Recursively compute the conditional mean duration (psi)
-        psi = np.empty(len(durations))
-        psi[0] = np.median(durations)
-        for i in range(1, len(durations)):
-            psi[i] = self.omega + self.alpha * durations[i-1] + self.beta * psi[i-1]
-        # Optionally scale the indicator
-        if np.max(np.abs(psi)) != 0:
-            psi = psi / np.max(np.abs(psi)) * scale
-        # Return with column name "bvc" to be consistent with other indicators
-        indicator_df = pd.DataFrame({
-            "stamp": df["stamp"].iloc[1:].reset_index(drop=True),
-            "bvc": psi
-        })
-        return indicator_df
 
 ###############################################################################
 # 6) INDICATOR CLASSES (HawkesBVC, ACDBVC, ACIBVC)
@@ -217,35 +162,6 @@ class HawkesBVC:
             bvc = bvc / np.max(np.abs(bvc)) * scale
         return pd.DataFrame({"stamp": df["stamp"], "bvc": bvc})
 
-class ACDBVC:
-    def __init__(self, kappa=0.1):
-        self.kappa = kappa
-
-    def eval(self, df: pd.DataFrame, scale=1e5):
-        df = df.copy().sort_values("stamp")
-        df["time_s"] = df["stamp"].astype(np.int64) // 10**9
-        df["duration"] = df["time_s"].diff().shift(-1)
-        df = df.dropna(subset=["duration"])
-        df = df[df["duration"] > 0]
-        if len(df) < 10:
-            return pd.DataFrame({"stamp": [], "bvc": []})
-        mean_dur = df["duration"].mean()
-        std_dur = df["duration"].std() or 1e-10
-        df["std_resid"] = (df["duration"] - mean_dur) / std_dur
-        df["price_change"] = np.log(df["close"] / df["close"].shift(1)).fillna(0)
-        df["label"] = -df["std_resid"] * df["price_change"]
-        df["weighted_volume"] = df["volume"] * df["label"]
-        alpha_exp = np.exp(-self.kappa)
-        bvc_list = []
-        current_bvc = 0.0
-        for wv in df["weighted_volume"].values:
-            current_bvc = current_bvc * alpha_exp + wv
-            bvc_list.append(current_bvc)
-        bvc = np.array(bvc_list)
-        if np.max(np.abs(bvc)) != 0:
-            bvc = bvc / np.max(np.abs(bvc)) * scale
-        df["bvc"] = bvc
-        return df[["stamp", "bvc"]].copy()
 
 class ACIBVC:
     def __init__(self, kappa=0.1):
